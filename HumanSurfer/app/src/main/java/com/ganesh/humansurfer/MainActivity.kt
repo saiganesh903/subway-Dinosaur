@@ -107,6 +107,11 @@ class MainActivity : AppCompatActivity() {
             stopHumanSurfer()
         }
 
+findViewById<Button>(R.id.btnCheckUpdate).setOnClickListener {
+            UpdateManager.checkForUpdate(this, showNoUpdateMessage = true)
+        }
+        }
+
         if (
             Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
@@ -116,6 +121,9 @@ class MainActivity : AppCompatActivity() {
                 Manifest.permission.POST_NOTIFICATIONS
             )
         }
+
+        // Check for a newer published Human Surfer build.
+        UpdateManager.checkForUpdate(this)
     }
 
     override fun onResume() {
