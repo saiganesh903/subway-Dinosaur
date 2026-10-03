@@ -38,8 +38,6 @@ kotlin {
         )
     }
 }
-    }
-}
 
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
