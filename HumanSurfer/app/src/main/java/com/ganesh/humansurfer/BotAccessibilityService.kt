@@ -73,7 +73,8 @@ class BotAccessibilityService : AccessibilityService() {
         UNKNOWN,
         GAMEPLAY,
         PLAY_OR_RESULT,
-        CONTINUE_DIALOG
+        CONTINUE_DIALOG,
+        ADVERTISEMENT
     }
 
     private enum class Action {
@@ -182,11 +183,25 @@ class BotAccessibilityService : AccessibilityService() {
         val packageName = event.packageName?.toString()
 
         if (packageName == GAME_PACKAGE) {
+            /*
+             * The game is the only window we are allowed to control.
+             */
             gameForeground = true
 
             if (enabled) {
                 beginController()
             }
+        } else if (packageName != null && gameForeground) {
+            /*
+             * The game lost foreground focus.
+             *
+             * IMPORTANT: stop all pending screenshot callbacks immediately.
+             * Otherwise a previously scheduled frame can dispatch a swipe
+             * after Subway Surfers has already closed or an ad/system screen
+             * has appeared.
+             */
+            gameForeground = false
+            stopController()
         }
     }
 
@@ -232,6 +247,7 @@ class BotAccessibilityService : AccessibilityService() {
 
     private fun stopController() {
         controllerActive = false
+        gameForeground = false
         state = BotState.STOPPED
 
         previousFrame?.recycle()
@@ -359,6 +375,18 @@ class BotAccessibilityService : AccessibilityService() {
         }
 
         val mode = detectScreenMode(bitmap, previousFrame)
+
+        /*
+         * AD HANDLING HAS PRIORITY OVER GAMEPLAY.
+         *
+         * An interstitial/reward ad can visually cover the game while the
+         * package name is still Subway Surfers. Never send a jump/swipe
+         * through an ad. First look for explicit Skip/Close controls.
+         */
+        if (handleAdvertisementControls(bitmap)) {
+            captureNextFrame(180L)
+            return
+        }
 
         /*
          * IMPORTANT:
@@ -551,6 +579,119 @@ class BotAccessibilityService : AccessibilityService() {
             blue != null
     }
 
+    /**
+     * Handles interstitial/reward advertisements without interacting with
+     * the ad itself. The controller only presses explicit Skip/Close/Dismiss
+     * controls. It never presses Install, Buy, Learn More, Open, or the ad
+     * creative.
+     *
+     * This is intentionally conservative because an ad may still belong to
+     * the Subway Surfers package. In that situation package-name checks alone
+     * cannot tell us that gameplay is covered.
+     */
+    private fun handleAdvertisementControls(bitmap: Bitmap): Boolean {
+        val now = SystemClock.elapsedRealtime()
+
+        if (now - lastPopupActionAt < 500L) {
+            return false
+        }
+
+        val root = rootInActiveWindow
+        var adSignal = false
+
+        if (root != null) {
+            adSignal = containsAdvertisementSignal(root)
+
+            if (adSignal) {
+                val skipOrClose = findNodeByTextOrDescription(
+                    root,
+                    listOf(
+                        "skip ad",
+                        "skip advertisement",
+                        "close ad",
+                        "close advertisement",
+                        "dismiss ad",
+                        "dismiss advertisement",
+                        "skip",
+                        "close",
+                        "dismiss",
+                        "×"
+                    )
+                )
+
+                if (skipOrClose != null && clickNodeSafely(skipOrClose)) {
+                    lastPopupActionAt = now
+                    state = BotState.RECOVERING
+                    consecutiveGameplayFrames = 0
+                    consecutiveStaticFrames = 0
+                    return true
+                }
+            }
+        }
+
+        /*
+         * Some ad SDKs expose no useful Accessibility text. If the
+         * accessibility tree strongly indicates an advertisement, allow the
+         * existing conservative red-X detector to close it.
+         */
+        if (adSignal) {
+            val visualClose = findRedCloseButton(bitmap)
+
+            if (visualClose != null) {
+                tap(
+                    visualClose.centerX(),
+                    visualClose.centerY()
+                )
+                lastPopupActionAt = now
+                state = BotState.RECOVERING
+                consecutiveGameplayFrames = 0
+                consecutiveStaticFrames = 0
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private fun containsAdvertisementSignal(
+        root: AccessibilityNodeInfo
+    ): Boolean {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.addLast(root)
+
+        val strongSignals = listOf(
+            "skip ad",
+            "skip advertisement",
+            "close ad",
+            "close advertisement",
+            "dismiss ad",
+            "dismiss advertisement",
+            "advertisement",
+            "ad choices",
+            "ad info"
+        )
+
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+
+            val text = node.text?.toString()?.trim()?.lowercase() ?: ""
+            val description =
+                node.contentDescription?.toString()?.trim()?.lowercase() ?: ""
+
+            if (strongSignals.any { signal ->
+                    text.contains(signal) || description.contains(signal)
+                }) {
+                return true
+            }
+
+            for (index in 0 until node.childCount) {
+                node.getChild(index)?.let { queue.addLast(it) }
+            }
+        }
+
+        return false
+    }
+
     private fun handleVisualScreen(
         mode: ScreenMode,
         bitmap: Bitmap
@@ -562,43 +703,52 @@ class BotAccessibilityService : AccessibilityService() {
             return false
         }
 
+        /*
+         * HIGHEST PRIORITY: a modal popup with a visible red/white X.
+         *
+         * The "Not Enough Keys" screen in the supplied screenshot is a
+         * modal overlay. We must close it before looking for Continue/Play.
+         */
+        val closeButton =
+            if (mode != ScreenMode.GAMEPLAY) {
+                findRedCloseButton(bitmap)
+            } else {
+                null
+            }
+
+        if (closeButton != null) {
+            tap(
+                closeButton.centerX(),
+                closeButton.centerY()
+            )
+
+            lastPopupActionAt = now
+            state = BotState.RECOVERING
+            consecutiveGameplayFrames = 0
+            consecutiveStaticFrames = 0
+
+            return true
+        }
+
         when (mode) {
 
             ScreenMode.CONTINUE_DIALOG -> {
                 /*
-                 * First choice: use the key Continue button shown in the
-                 * supplied screenshot. This returns directly to the run
-                 * without watching an ad.
-                 */
-                val keyButton =
-                    findLargeBlueButton(
-                        bitmap,
-                        0.45f,
-                        0.61f
-                    )
-
-                if (keyButton != null) {
-                    tap(
-                        keyButton.centerX(),
-                        keyButton.centerY()
-                    )
-
-                    lastPopupActionAt = now
-                    deathRecoveryCount++
-                    resetAfterRecovery()
-
-                    return true
-                }
-
-                /*
-                 * If no blue key button exists, use the green ad
-                 * Continue button as a fallback.
+                 * IMPORTANT:
+                 * NEVER tap the blue key Continue button.
+                 *
+                 * The first supplied screenshot shows that button as:
+                 * "4 [key]"
+                 *
+                 * Tapping it spends keys and can open "Not Enough Keys".
+                 *
+                 * We specifically choose the GREEN "Continue + Ad" button.
                  */
                 val adContinue =
                     findLargeGreenButton(
                         bitmap,
-                        0.55f,
-                        0.72f
+                        0.54f,
+                        0.75f
                     )
 
                 if (adContinue != null) {
@@ -614,6 +764,11 @@ class BotAccessibilityService : AccessibilityService() {
                     return true
                 }
 
+                /*
+                 * If the green Continue button is not confidently found,
+                 * DO NOTHING. Waiting is safer than spending keys or
+                 * pressing a random location.
+                 */
                 return false
             }
 
@@ -679,6 +834,12 @@ class BotAccessibilityService : AccessibilityService() {
             findNodeByTextOrDescription(
                 root,
                 listOf(
+                    "close ad",
+                    "close advertisement",
+                    "skip ad",
+                    "skip advertisement",
+                    "dismiss ad",
+                    "dismiss advertisement",
                     "close",
                     "dismiss",
                     "skip",
@@ -826,6 +987,242 @@ class BotAccessibilityService : AccessibilityService() {
      * This avoids hard-coding 691x1536 coordinates. The supplied
      * screenshots are scaled to the actual screenshot dimensions.
      */
+
+    /*
+     * Detect the red circular X used by the "Not Enough Keys" modal.
+     *
+     * We intentionally search only in the upper-right part of the screen
+     * and require a sufficiently large connected red region. This prevents
+     * ordinary red game objects from being mistaken for a close button.
+     */
+    private fun findRedCloseButton(
+        bitmap: Bitmap
+    ): VisualRegion? {
+
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val sampleStep =
+            max(7, min(width, height) / 140)
+
+        val cols =
+            max(1, width / sampleStep)
+
+        val rows =
+            max(1, height / sampleStep)
+
+        val minXFraction = 0.68f
+        val maxXFraction = 0.99f
+        val minYFraction = 0.18f
+        val maxYFraction = 0.60f
+
+        val active =
+            BooleanArray(cols * rows)
+
+        fun index(x: Int, y: Int): Int =
+            y * cols + x
+
+        val startX =
+            max(0, (cols * minXFraction).toInt())
+
+        val endX =
+            min(cols - 1, (cols * maxXFraction).toInt())
+
+        val startY =
+            max(0, (rows * minYFraction).toInt())
+
+        val endY =
+            min(rows - 1, (rows * maxYFraction).toInt())
+
+        for (gy in startY..endY) {
+            val py =
+                min(
+                    height - 1,
+                    gy * sampleStep +
+                        sampleStep / 2
+                )
+
+            for (gx in startX..endX) {
+                val px =
+                    min(
+                        width - 1,
+                        gx * sampleStep +
+                            sampleStep / 2
+                    )
+
+                val c =
+                    bitmap.getPixel(px, py)
+
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+
+                if (
+                    r > 145 &&
+                    r > g * 1.35f &&
+                    r > b * 1.25f
+                ) {
+                    active[index(gx, gy)] = true
+                }
+            }
+        }
+
+        val visited =
+            BooleanArray(cols * rows)
+
+        val queue =
+            ArrayDeque<Int>()
+
+        var best: VisualRegion? = null
+        var bestScore = 0f
+
+        for (gy in startY..endY) {
+            for (gx in startX..endX) {
+
+                val startIndex =
+                    index(gx, gy)
+
+                if (
+                    !active[startIndex] ||
+                    visited[startIndex]
+                ) {
+                    continue
+                }
+
+                queue.clear()
+                queue.addLast(startIndex)
+                visited[startIndex] = true
+
+                var minX = gx
+                var maxX = gx
+                var minY = gy
+                var maxY = gy
+                var count = 0
+
+                while (queue.isNotEmpty()) {
+                    val current =
+                        queue.removeFirst()
+
+                    val cx =
+                        current % cols
+
+                    val cy =
+                        current / cols
+
+                    count++
+
+                    minX = min(minX, cx)
+                    maxX = max(maxX, cx)
+                    minY = min(minY, cy)
+                    maxY = max(maxY, cy)
+
+                    val neighbors =
+                        intArrayOf(
+                            current - 1,
+                            current + 1,
+                            current - cols,
+                            current + cols
+                        )
+
+                    for (n in neighbors) {
+                        if (
+                            n < 0 ||
+                            n >= active.size ||
+                            visited[n] ||
+                            !active[n]
+                        ) {
+                            continue
+                        }
+
+                        val nx = n % cols
+                        val ny = n / cols
+
+                        if (
+                            abs(nx - cx) +
+                            abs(ny - cy) != 1
+                        ) {
+                            continue
+                        }
+
+                        visited[n] = true
+                        queue.addLast(n)
+                    }
+                }
+
+                val left =
+                    minX * sampleStep
+
+                val top =
+                    minY * sampleStep
+
+                val right =
+                    min(
+                        width,
+                        (maxX + 1) * sampleStep
+                    )
+
+                val bottom =
+                    min(
+                        height,
+                        (maxY + 1) * sampleStep
+                    )
+
+                val region =
+                    VisualRegion(
+                        left,
+                        top,
+                        right,
+                        bottom,
+                        count
+                    )
+
+                val widthRatio =
+                    region.width().toFloat() /
+                        width
+
+                val heightRatio =
+                    region.height().toFloat() /
+                        height
+
+                val centerXRatio =
+                    region.centerX().toFloat() /
+                        width
+
+                /*
+                 * A close icon should be compact, roughly square,
+                 * reasonably large, and close to the upper-right corner.
+                 */
+                val aspect =
+                    if (region.height() > 0) {
+                        region.width().toFloat() /
+                            region.height()
+                    } else {
+                        99f
+                    }
+
+                if (
+                    count >= 8 &&
+                    widthRatio >= 0.025f &&
+                    widthRatio <= 0.16f &&
+                    heightRatio >= 0.02f &&
+                    heightRatio <= 0.12f &&
+                    aspect in 0.55f..1.8f &&
+                    centerXRatio >= 0.75f
+                ) {
+                    val score =
+                        count.toFloat() *
+                            (0.5f + centerXRatio)
+
+                    if (score > bestScore) {
+                        bestScore = score
+                        best = region
+                    }
+                }
+            }
+        }
+
+        return best
+    }
 
     private fun findLargeGreenButton(
         bitmap: Bitmap,
@@ -1871,6 +2268,20 @@ class BotAccessibilityService : AccessibilityService() {
         width: Int,
         height: Int
     ) {
+
+        /*
+         * Last-line safety gate.
+         * If the game is no longer foreground, absolutely no gameplay
+         * gesture is allowed.
+         */
+        if (
+            !enabled ||
+            !controllerActive ||
+            !gameForeground ||
+            durationExpired()
+        ) {
+            return
+        }
 
         val now =
             SystemClock.elapsedRealtime()
