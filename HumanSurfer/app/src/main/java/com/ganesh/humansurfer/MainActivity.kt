@@ -107,9 +107,8 @@ class MainActivity : AppCompatActivity() {
             stopHumanSurfer()
         }
 
-findViewById<Button>(R.id.btnCheckUpdate).setOnClickListener {
+        findViewById<Button>(R.id.btnCheckUpdate).setOnClickListener {
             UpdateManager.checkForUpdate(this, showNoUpdateMessage = true)
-        }
         }
 
         if (
