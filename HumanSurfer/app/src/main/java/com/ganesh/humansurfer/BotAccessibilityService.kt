@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.Bitmap.Config
 import android.graphics.Color
 import android.graphics.Path
+import android.graphics.Rect
 import android.hardware.HardwareBuffer
 import android.os.Build
 import android.os.Handler
@@ -14,21 +15,34 @@ import android.os.SystemClock
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
 
+/**
+ * HumanSurfer controller.
+ *
+ * This version is safety-first:
+ * 1. Detects the important Subway Surfers UI screens visually.
+ * 2. Uses accessibility text only as a secondary recovery path.
+ * 3. Never uses a fixed prerecorded move sequence.
+ * 4. Detects relative danger between the three lanes instead of
+ *    treating every edge/motion in the scene as an obstacle.
+ * 5. Reacts quickly when an approaching obstacle is detected.
+ *
+ * It is still a heuristic vision controller, not a trained game-specific
+ * object detector. The thresholds are deliberately conservative.
+ */
 class BotAccessibilityService : AccessibilityService() {
 
     companion object {
-
         const val ACTION_STOP = "com.ganesh.humansurfer.STOP_BOT"
 
         private const val GAME_PACKAGE = "com.kiloo.subwaysurf"
 
         private var instance: BotAccessibilityService? = null
-
         private var requestedDurationMinutes = 0
         private var requestedStartTime = 0L
         private var enabled = false
@@ -55,13 +69,19 @@ class BotAccessibilityService : AccessibilityService() {
         STOPPED
     }
 
+    private enum class ScreenMode {
+        UNKNOWN,
+        GAMEPLAY,
+        PLAY_OR_RESULT,
+        CONTINUE_DIALOG
+    }
+
     private enum class Action {
         NONE,
         LEFT,
         RIGHT,
         JUMP,
         ROLL,
-        HOVERBOARD,
         TAP
     }
 
@@ -73,46 +93,59 @@ class BotAccessibilityService : AccessibilityService() {
         val gestureMs: Long
     )
 
-    private data class LaneInfo(
-        val risk: Float,
+    private data class VisualRegion(
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+        val cells: Int
+    ) {
+        fun centerX(): Int = (left + right) / 2
+        fun centerY(): Int = (top + bottom) / 2
+        fun width(): Int = right - left
+        fun height(): Int = bottom - top
+    }
+
+    private data class BandMetrics(
+        val edge: Float,
+        val strongEdge: Float,
         val motion: Float,
-        val edges: Float,
-        val darkness: Float,
-        val centerBrightness: Float
+        val darkness: Float
+    )
+
+    private data class LaneInfo(
+        val rawRisk: Float,
+        val risk: Float,
+        val nearEdge: Float,
+        val midEdge: Float,
+        val nearMotion: Float,
+        val midMotion: Float,
+        val nearDark: Float,
+        val approach: Float
     )
 
     private val handler = Handler(Looper.getMainLooper())
-
     private val random = Random(System.currentTimeMillis())
 
     private var controllerActive = false
-
     private var state = BotState.WAITING_FOR_GAME
 
     private var lastScreenshotAt = 0L
     private var lastActionAt = 0L
-    private var lastRecoveryActionAt = 0L
     private var lastStartTapAt = 0L
     private var lastPopupActionAt = 0L
+    private var lastLaneChangeAt = 0L
+    private var startGraceUntil = 0L
 
     private var lastFrame: Bitmap? = null
     private var previousFrame: Bitmap? = null
 
     private var currentLane = 1
-
     private var missedFrames = 0
-
     private var gameForeground = false
-
-    private var gameStartedAt = 0L
-
     private var consecutiveGameplayFrames = 0
-
     private var consecutiveStaticFrames = 0
-
     private var deathRecoveryCount = 0
-
-    private var lastKnownScoreScreen = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -125,7 +158,6 @@ class BotAccessibilityService : AccessibilityService() {
         )
 
         if (prefs.getBoolean("bot_enabled", false)) {
-
             requestedDurationMinutes = when (
                 prefs.getInt("duration_minutes", 5)
             ) {
@@ -137,24 +169,17 @@ class BotAccessibilityService : AccessibilityService() {
                 else -> 0
             }
 
-            requestedStartTime =
-                SystemClock.elapsedRealtime()
-
+            requestedStartTime = SystemClock.elapsedRealtime()
             enabled = true
-
             resetSession()
-
             beginController()
         }
     }
 
-    override fun onAccessibilityEvent(
-        event: AccessibilityEvent?
-    ) {
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
-        val packageName =
-            event.packageName?.toString()
+        val packageName = event.packageName?.toString()
 
         if (packageName == GAME_PACKAGE) {
             gameForeground = true
@@ -171,37 +196,25 @@ class BotAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         stopController()
-
         instance = null
-
         handler.removeCallbacksAndMessages(null)
-
         super.onDestroy()
     }
 
     private fun resetSession() {
-
         state = BotState.WAITING_FOR_GAME
-
         currentLane = 1
-
         missedFrames = 0
-
         consecutiveGameplayFrames = 0
-
         consecutiveStaticFrames = 0
-
         deathRecoveryCount = 0
 
         lastScreenshotAt = 0L
         lastActionAt = 0L
-        lastRecoveryActionAt = 0L
         lastStartTapAt = 0L
         lastPopupActionAt = 0L
-
-        gameStartedAt = 0L
-
-        lastKnownScoreScreen = false
+        lastLaneChangeAt = 0L
+        startGraceUntil = 0L
 
         previousFrame?.recycle()
         previousFrame = null
@@ -211,20 +224,14 @@ class BotAccessibilityService : AccessibilityService() {
     }
 
     private fun beginController() {
-
-        if (!enabled) return
-
-        if (controllerActive) return
+        if (!enabled || controllerActive) return
 
         controllerActive = true
-
-        captureNextFrame(250L)
+        captureNextFrame(180L)
     }
 
     private fun stopController() {
-
         controllerActive = false
-
         state = BotState.STOPPED
 
         previousFrame?.recycle()
@@ -234,12 +241,10 @@ class BotAccessibilityService : AccessibilityService() {
         lastFrame = null
 
         missedFrames = 0
-
         handler.removeCallbacksAndMessages(null)
     }
 
     private fun durationExpired(): Boolean {
-
         if (!enabled) return true
 
         if (requestedDurationMinutes <= 0) {
@@ -247,84 +252,59 @@ class BotAccessibilityService : AccessibilityService() {
         }
 
         val elapsed =
-            SystemClock.elapsedRealtime() -
-                requestedStartTime
+            SystemClock.elapsedRealtime() - requestedStartTime
 
-        return elapsed >=
-            requestedDurationMinutes * 60_000L
+        return elapsed >= requestedDurationMinutes * 60_000L
     }
 
     private fun captureNextFrame(delayMs: Long) {
-
-        if (!controllerActive ||
-            !enabled ||
-            durationExpired()
-        ) {
+        if (!controllerActive || !enabled || durationExpired()) {
             stopController()
             return
         }
 
-        val now =
-            SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
 
-        val minimumFrameGap =
-            130L
+        // Fast enough to react to approaching obstacles.
+        val minimumFrameGap = 85L
 
-        val wait =
-            max(
-                delayMs,
-                minimumFrameGap -
-                    (now - lastScreenshotAt)
-            )
+        val wait = max(
+            delayMs,
+            minimumFrameGap - (now - lastScreenshotAt)
+        )
 
         handler.postDelayed(
-            {
-                takeGameScreenshot()
-            },
+            { takeGameScreenshot() },
             wait
         )
     }
 
     private fun takeGameScreenshot() {
-
-        if (!controllerActive ||
-            !enabled ||
-            durationExpired()
-        ) {
+        if (!controllerActive || !enabled || durationExpired()) {
             stopController()
             return
         }
 
         if (!gameForeground) {
-
             state = BotState.WAITING_FOR_GAME
-
-            captureNextFrame(500L)
-
+            captureNextFrame(350L)
             return
         }
 
         if (Build.VERSION.SDK_INT < 30) {
-
             stopController()
-
             return
         }
 
-        lastScreenshotAt =
-            SystemClock.elapsedRealtime()
+        lastScreenshotAt = SystemClock.elapsedRealtime()
 
         takeScreenshot(
             Display.DEFAULT_DISPLAY,
             mainExecutor,
             object : TakeScreenshotCallback {
 
-                override fun onSuccess(
-                    screenshot: ScreenshotResult
-                ) {
-
-                    val buffer:
-                        HardwareBuffer =
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    val buffer: HardwareBuffer =
                         screenshot.hardwareBuffer
 
                     val hardware =
@@ -340,48 +320,31 @@ class BotAccessibilityService : AccessibilityService() {
                         )
 
                     hardware?.recycle()
-
                     buffer.close()
 
                     if (bitmap == null) {
-
                         missedFrames++
 
                         captureNextFrame(
-                            if (missedFrames > 3) {
-                                400L
-                            } else {
-                                200L
-                            }
+                            if (missedFrames > 3) 180L else 100L
                         )
 
                         return
                     }
 
                     previousFrame?.recycle()
-
                     previousFrame = lastFrame
-
                     lastFrame = bitmap
-
                     missedFrames = 0
 
                     processFrame(bitmap)
-
                 }
 
-                override fun onFailure(
-                    errorCode: Int
-                ) {
-
+                override fun onFailure(errorCode: Int) {
                     missedFrames++
 
                     captureNextFrame(
-                        if (missedFrames > 3) {
-                            400L
-                        } else {
-                            200L
-                        }
+                        if (missedFrames > 3) 250L else 120L
                     )
                 }
             }
@@ -389,125 +352,97 @@ class BotAccessibilityService : AccessibilityService() {
     }
 
     private fun processFrame(bitmap: Bitmap) {
-
         if (!gameForeground) {
-
-            state =
-                BotState.WAITING_FOR_GAME
-
-            captureNextFrame(500L)
-
-            return
-        }
-
-        /*
-         * FIRST PRIORITY:
-         *
-         * Handle Android/game UI before
-         * attempting gameplay gestures.
-         */
-        if (handleVisibleControls()) {
-
-            state =
-                BotState.RECOVERING
-
+            state = BotState.WAITING_FOR_GAME
             captureNextFrame(350L)
+            return
+        }
 
+        val mode = detectScreenMode(bitmap, previousFrame)
+
+        /*
+         * IMPORTANT:
+         * Visual recovery is checked BEFORE gameplay decisions.
+         *
+         * This fixes the Continue?/result screens from the screenshots.
+         */
+        if (handleVisualScreen(mode, bitmap)) {
+            captureNextFrame(180L)
             return
         }
 
         /*
-         * Detect whether the screen looks
-         * like an active gameplay frame.
+         * Accessibility recovery is secondary because many game
+         * controls are rendered on a canvas and expose no text.
          */
+        if (handleAccessibilityControls()) {
+            state = BotState.RECOVERING
+            captureNextFrame(180L)
+            return
+        }
+
+        if (mode == ScreenMode.PLAY_OR_RESULT) {
+            // The visual handler normally consumes this.
+            // Keep observing instead of making a blind center tap.
+            captureNextFrame(150L)
+            return
+        }
+
         val gameplayScore =
-            detectGameplayScore(
-                bitmap,
-                previousFrame
-            )
+            detectGameplayScore(bitmap, previousFrame)
 
-        /*
-         * If the screen is changing enough
-         * to look like active gameplay,
-         * move into PLAYING state.
-         */
-        if (gameplayScore > 0.52f) {
-
+        if (mode == ScreenMode.GAMEPLAY ||
+            state == BotState.STARTING ||
+            gameplayScore > 0.16f
+        ) {
             consecutiveGameplayFrames++
-
             consecutiveStaticFrames = 0
-
         } else {
-
             consecutiveStaticFrames++
-
             consecutiveGameplayFrames = 0
         }
 
-        /*
-         * If gameplay has been observed
-         * repeatedly, we trust that the
-         * actual run has started.
-         */
-        if (consecutiveGameplayFrames >= 3) {
-
-            if (state != BotState.PLAYING) {
-
+        if (consecutiveGameplayFrames >= 2 ||
+            state == BotState.STARTING
+        ) {
+            if (state != BotState.PLAYING &&
+                state != BotState.RECOVERING
+            ) {
                 state = BotState.PLAYING
-
-                if (gameStartedAt == 0L) {
-                    gameStartedAt =
-                        SystemClock.elapsedRealtime()
-                }
             }
         }
 
         /*
-         * Static game screen:
-         *
-         * attempt a safe center tap after
-         * waiting for UI to settle.
-         *
-         * This handles:
-         *
-         * Tap to play
-         * Play
-         * Continue
-         * Start
+         * After pressing PLAY, give the runner only a short grace period.
+         * The old implementation could wait several seconds before the
+         * first real decision, which is too late for early obstacles.
          */
-        if (state != BotState.PLAYING) {
+        val now = SystemClock.elapsedRealtime()
 
-            attemptStartTap(
-                bitmap.width,
-                bitmap.height
-            )
-
-            captureNextFrame(500L)
-
+        if (state == BotState.STARTING &&
+            now < startGraceUntil
+        ) {
+            captureNextFrame(90L)
             return
         }
 
-        /*
-         * Gameplay brain.
-         */
+        if (state != BotState.PLAYING) {
+            captureNextFrame(120L)
+            return
+        }
+
         val decision =
             GameBrain.decide(
                 bitmap = bitmap,
                 previous = previousFrame,
                 currentLane = currentLane,
+                lastLaneChangeAt = lastLaneChangeAt,
+                now = now,
                 random = random
             )
 
         if (decision != null) {
-
-            val now =
-                SystemClock.elapsedRealtime()
-
-            if (
-                now - lastActionAt >=
-                decision.cooldownMs
-            ) {
-
+            if (now - lastActionAt >= decision.cooldownMs) {
                 performDecision(
                     decision,
                     bitmap.width,
@@ -515,37 +450,230 @@ class BotAccessibilityService : AccessibilityService() {
                 )
             }
 
-            captureNextFrame(
-                decision.nextCaptureMs
-            )
-
+            captureNextFrame(decision.nextCaptureMs)
         } else {
-
-            captureNextFrame(160L)
+            captureNextFrame(95L)
         }
     }
 
     /*
-     * ---------------------------------------------------------
-     * UI / POPUP / RECOVERY CONTROLLER
-     * ---------------------------------------------------------
+     * ------------------------------------------------------------
+     * SCREEN / UI DETECTION
+     * ------------------------------------------------------------
      */
 
-    private fun handleVisibleControls(): Boolean {
+    private fun detectScreenMode(
+        bitmap: Bitmap,
+        previous: Bitmap?
+    ): ScreenMode {
 
-        val root =
-            rootInActiveWindow
-                ?: return false
+        if (detectContinueDialog(bitmap)) {
+            return ScreenMode.CONTINUE_DIALOG
+        }
 
-        if (
-            SystemClock.elapsedRealtime() -
-            lastPopupActionAt < 800L
+        /*
+         * Main menu and result screen both contain a large green PLAY
+         * button near the bottom. We deliberately choose the LOWEST
+         * large green button so "Watch Video" above it is ignored.
+         */
+        if (findLargeGreenButton(
+                bitmap,
+                0.76f,
+                0.995f
+            ) != null
         ) {
+            return ScreenMode.PLAY_OR_RESULT
+        }
+
+        if (state == BotState.PLAYING ||
+            state == BotState.STARTING
+        ) {
+            return ScreenMode.GAMEPLAY
+        }
+
+        val score =
+            detectGameplayScore(bitmap, previous)
+
+        return if (score > 0.18f) {
+            ScreenMode.GAMEPLAY
+        } else {
+            ScreenMode.UNKNOWN
+        }
+    }
+
+    private fun detectContinueDialog(bitmap: Bitmap): Boolean {
+        if (bitmap.width < 300 || bitmap.height < 500) {
+            return false
+        }
+
+        val topAverage =
+            averageLuminance(
+                bitmap,
+                0.00f,
+                0.28f,
+                0.00f,
+                1.00f
+            )
+
+        val bottomAverage =
+            averageLuminance(
+                bitmap,
+                0.72f,
+                1.00f,
+                0.00f,
+                1.00f
+            )
+
+        val centerWhiteRatio =
+            whiteRatio(
+                bitmap,
+                0.06f,
+                0.74f,
+                0.08f,
+                0.92f
+            )
+
+        val blue =
+            findLargeBlueButton(
+                bitmap,
+                0.45f,
+                0.61f
+            )
+
+        /*
+         * Screenshot pattern:
+         * darkened game background + large white Continue panel
+         * + blue key button / green ad button.
+         */
+        return topAverage < 105f &&
+            bottomAverage < 105f &&
+            centerWhiteRatio > 0.24f &&
+            blue != null
+    }
+
+    private fun handleVisualScreen(
+        mode: ScreenMode,
+        bitmap: Bitmap
+    ): Boolean {
+
+        val now = SystemClock.elapsedRealtime()
+
+        if (now - lastPopupActionAt < 450L) {
+            return false
+        }
+
+        when (mode) {
+
+            ScreenMode.CONTINUE_DIALOG -> {
+                /*
+                 * First choice: use the key Continue button shown in the
+                 * supplied screenshot. This returns directly to the run
+                 * without watching an ad.
+                 */
+                val keyButton =
+                    findLargeBlueButton(
+                        bitmap,
+                        0.45f,
+                        0.61f
+                    )
+
+                if (keyButton != null) {
+                    tap(
+                        keyButton.centerX(),
+                        keyButton.centerY()
+                    )
+
+                    lastPopupActionAt = now
+                    deathRecoveryCount++
+                    resetAfterRecovery()
+
+                    return true
+                }
+
+                /*
+                 * If no blue key button exists, use the green ad
+                 * Continue button as a fallback.
+                 */
+                val adContinue =
+                    findLargeGreenButton(
+                        bitmap,
+                        0.55f,
+                        0.72f
+                    )
+
+                if (adContinue != null) {
+                    tap(
+                        adContinue.centerX(),
+                        adContinue.centerY()
+                    )
+
+                    lastPopupActionAt = now
+                    deathRecoveryCount++
+                    resetAfterRecovery()
+
+                    return true
+                }
+
+                return false
+            }
+
+            ScreenMode.PLAY_OR_RESULT -> {
+                val play =
+                    findLargeGreenButton(
+                        bitmap,
+                        0.76f,
+                        0.995f
+                    )
+
+                if (play != null) {
+                    tap(
+                        play.centerX(),
+                        play.centerY()
+                    )
+
+                    lastStartTapAt = now
+                    lastPopupActionAt = now
+
+                    state = BotState.STARTING
+                    currentLane = 1
+
+                    /*
+                     * Do NOT wait 3 seconds. Start observing almost
+                     * immediately after the PLAY tap.
+                     */
+                    startGraceUntil = now + 320L
+
+                    consecutiveGameplayFrames = 0
+                    consecutiveStaticFrames = 0
+
+                    return true
+                }
+
+                return false
+            }
+
+            else -> return false
+        }
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * ACCESSIBILITY UI FALLBACK
+     * ------------------------------------------------------------
+     */
+
+    private fun handleAccessibilityControls(): Boolean {
+        val root = rootInActiveWindow ?: return false
+
+        val now = SystemClock.elapsedRealtime()
+
+        if (now - lastPopupActionAt < 600L) {
             return false
         }
 
         /*
-         * First handle explicit dismiss controls.
+         * Safe dismiss words only.
+         * We do not click arbitrary advertisement actions.
          */
         val dismissNode =
             findNodeByTextOrDescription(
@@ -557,25 +685,17 @@ class BotAccessibilityService : AccessibilityService() {
                     "no thanks",
                     "not now",
                     "cancel",
-                    "×",
-                    "x"
+                    "×"
                 )
             )
 
         if (dismissNode != null) {
-
             if (clickNodeSafely(dismissNode)) {
-
-                lastPopupActionAt =
-                    SystemClock.elapsedRealtime()
-
+                lastPopupActionAt = now
                 return true
             }
         }
 
-        /*
-         * Handle game-over/restart controls.
-         */
         val restartNode =
             findNodeByTextOrDescription(
                 root,
@@ -584,45 +704,20 @@ class BotAccessibilityService : AccessibilityService() {
                     "retry",
                     "restart",
                     "try again",
-                    "play",
-                    "continue",
                     "tap to play",
                     "tap to continue"
                 )
             )
 
         if (restartNode != null) {
-
             if (clickNodeSafely(restartNode)) {
-
+                lastPopupActionAt = now
                 deathRecoveryCount++
-
-                lastRecoveryActionAt =
-                    SystemClock.elapsedRealtime()
-
-                lastPopupActionAt =
-                    SystemClock.elapsedRealtime()
-
-                currentLane = 1
-
-                state =
-                    BotState.RECOVERING
-
-                consecutiveGameplayFrames = 0
-
-                consecutiveStaticFrames = 0
-
+                resetAfterRecovery()
                 return true
             }
         }
 
-        /*
-         * Sometimes the game exposes no
-         * useful accessibility text.
-         *
-         * In that case we use the visual
-         * controller's recovery logic later.
-         */
         return false
     }
 
@@ -631,15 +726,11 @@ class BotAccessibilityService : AccessibilityService() {
         phrases: List<String>
     ): AccessibilityNodeInfo? {
 
-        val queue =
-            ArrayDeque<AccessibilityNodeInfo>()
-
-        queue.add(root)
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.addLast(root)
 
         while (queue.isNotEmpty()) {
-
-            val node =
-                queue.removeFirst()
+            val node = queue.removeFirst()
 
             val text =
                 node.text
@@ -661,36 +752,27 @@ class BotAccessibilityService : AccessibilityService() {
                     ?: ""
 
             for (phrase in phrases) {
-
-                val target =
-                    phrase.lowercase()
+                val target = phrase.lowercase()
+                val normalized =
+                    target.replace(" ", "_")
 
                 if (
                     text == target ||
                     description == target ||
                     text.contains(target) ||
                     description.contains(target) ||
-                    resource.contains(
-                        target.replace(" ", "_")
-                    )
+                    resource.contains(normalized)
                 ) {
-
-                    if (
-                        node.isVisibleToUser
-                    ) {
+                    if (node.isVisibleToUser) {
                         return node
                     }
                 }
             }
 
-            for (
-                index in 0 until node.childCount
-            ) {
-
-                node.getChild(index)
-                    ?.let {
-                        queue.add(it)
-                    }
+            for (index in 0 until node.childCount) {
+                node.getChild(index)?.let {
+                    queue.addLast(it)
+                }
             }
         }
 
@@ -702,100 +784,1086 @@ class BotAccessibilityService : AccessibilityService() {
     ): Boolean {
 
         try {
-
             if (
                 node.isClickable &&
                 node.performAction(
-                    AccessibilityNodeInfo
-                        .ACTION_CLICK
+                    AccessibilityNodeInfo.ACTION_CLICK
                 )
             ) {
                 return true
             }
 
-            /*
-             * Some game/overlay controls
-             * don't expose ACTION_CLICK.
-             *
-             * Fall back to tapping the
-             * node's screen bounds.
-             */
-            val rect =
-                android.graphics.Rect()
-
+            val rect = Rect()
             node.getBoundsInScreen(rect)
 
-            if (
-                rect.width() > 0 &&
-                rect.height() > 0
-            ) {
-
+            if (rect.width() > 0 && rect.height() > 0) {
                 tap(
                     rect.centerX(),
                     rect.centerY()
                 )
-
                 return true
             }
-
         } catch (_: Exception) {
         }
 
         return false
     }
 
-    private fun attemptStartTap(
-        width: Int,
-        height: Int
-    ) {
-
-        val now =
-            SystemClock.elapsedRealtime()
-
-        /*
-         * Don't repeatedly hammer the
-         * screen.
-         */
-        if (
-            now - lastStartTapAt < 1800L
-        ) {
-            return
-        }
-
-        /*
-         * Give the game time to settle.
-         */
-        if (
-            gameStartedAt != 0L &&
-            now - gameStartedAt < 1000L
-        ) {
-            return
-        }
-
-        /*
-         * Start/tap zone.
-         *
-         * We deliberately avoid the
-         * very top/bottom UI areas.
-         */
-        val x =
-            width / 2
-
-        val y =
-            (height * 0.58f).toInt()
-
-        tap(x, y)
-
-        lastStartTapAt = now
-
-        state =
-            BotState.STARTING
+    private fun resetAfterRecovery() {
+        currentLane = 1
+        state = BotState.RECOVERING
+        consecutiveGameplayFrames = 0
+        consecutiveStaticFrames = 0
+        lastLaneChangeAt = SystemClock.elapsedRealtime()
+        startGraceUntil = SystemClock.elapsedRealtime() + 380L
     }
 
     /*
-     * ---------------------------------------------------------
-     * GAMEPLAY GESTURE CONTROLLER
-     * ---------------------------------------------------------
+     * ------------------------------------------------------------
+     * VISUAL COLOR REGION FINDER
+     * ------------------------------------------------------------
+     *
+     * This avoids hard-coding 691x1536 coordinates. The supplied
+     * screenshots are scaled to the actual screenshot dimensions.
+     */
+
+    private fun findLargeGreenButton(
+        bitmap: Bitmap,
+        yStartFraction: Float,
+        yEndFraction: Float
+    ): VisualRegion? {
+        return findLargeColorRegion(
+            bitmap,
+            yStartFraction,
+            yEndFraction,
+            ColorKind.GREEN
+        )
+    }
+
+    private fun findLargeBlueButton(
+        bitmap: Bitmap,
+        yStartFraction: Float,
+        yEndFraction: Float
+    ): VisualRegion? {
+        return findLargeColorRegion(
+            bitmap,
+            yStartFraction,
+            yEndFraction,
+            ColorKind.BLUE
+        )
+    }
+
+    private enum class ColorKind {
+        GREEN,
+        BLUE
+    }
+
+    private fun findLargeColorRegion(
+        bitmap: Bitmap,
+        yStartFraction: Float,
+        yEndFraction: Float,
+        kind: ColorKind
+    ): VisualRegion? {
+
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val sampleStep =
+            max(8, min(width, height) / 120)
+
+        val cols =
+            max(1, width / sampleStep)
+
+        val rows =
+            max(1, height / sampleStep)
+
+        val startRow =
+            max(
+                0,
+                (rows * yStartFraction).toInt()
+            )
+
+        val endRow =
+            min(
+                rows - 1,
+                (rows * yEndFraction).toInt()
+            )
+
+        val active =
+            BooleanArray(cols * rows)
+
+        fun index(x: Int, y: Int): Int =
+            y * cols + x
+
+        for (gy in startRow..endRow) {
+            val py =
+                min(
+                    height - 1,
+                    gy * sampleStep +
+                        sampleStep / 2
+                )
+
+            for (gx in 0 until cols) {
+                val px =
+                    min(
+                        width - 1,
+                        gx * sampleStep +
+                            sampleStep / 2
+                    )
+
+                val color =
+                    bitmap.getPixel(px, py)
+
+                if (isTargetColor(color, kind)) {
+                    active[index(gx, gy)] = true
+                }
+            }
+        }
+
+        val visited =
+            BooleanArray(cols * rows)
+
+        val regions =
+            ArrayList<VisualRegion>()
+
+        val queue = ArrayDeque<Int>()
+
+        for (gy in startRow..endRow) {
+            for (gx in 0 until cols) {
+                val startIndex = index(gx, gy)
+
+                if (!active[startIndex] ||
+                    visited[startIndex]
+                ) {
+                    continue
+                }
+
+                queue.clear()
+                queue.addLast(startIndex)
+                visited[startIndex] = true
+
+                var minX = gx
+                var maxX = gx
+                var minY = gy
+                var maxY = gy
+                var count = 0
+
+                while (queue.isNotEmpty()) {
+                    val current =
+                        queue.removeFirst()
+
+                    val cx =
+                        current % cols
+                    val cy =
+                        current / cols
+
+                    count++
+
+                    minX = min(minX, cx)
+                    maxX = max(maxX, cx)
+                    minY = min(minY, cy)
+                    maxY = max(maxY, cy)
+
+                    val neighbors =
+                        intArrayOf(
+                            current - 1,
+                            current + 1,
+                            current - cols,
+                            current + cols
+                        )
+
+                    for (n in neighbors) {
+                        if (n < 0 ||
+                            n >= active.size ||
+                            visited[n] ||
+                            !active[n]
+                        ) {
+                            continue
+                        }
+
+                        val nx =
+                            n % cols
+                        val ny =
+                            n / cols
+
+                        if (abs(nx - cx) +
+                            abs(ny - cy) != 1
+                        ) {
+                            continue
+                        }
+
+                        visited[n] = true
+                        queue.addLast(n)
+                    }
+                }
+
+                val left =
+                    minX * sampleStep
+
+                val top =
+                    minY * sampleStep
+
+                val right =
+                    min(
+                        width,
+                        (maxX + 1) * sampleStep
+                    )
+
+                val bottom =
+                    min(
+                        height,
+                        (maxY + 1) * sampleStep
+                    )
+
+                val region =
+                    VisualRegion(
+                        left,
+                        top,
+                        right,
+                        bottom,
+                        count
+                    )
+
+                val widthRatio =
+                    region.width().toFloat() /
+                        width
+
+                val heightRatio =
+                    region.height().toFloat() /
+                        height
+
+                /*
+                 * Buttons are large connected rectangles.
+                 * Small green objects/coins are rejected here.
+                 */
+                if (
+                    count >= 14 &&
+                    widthRatio >= 0.20f &&
+                    heightRatio >= 0.025f
+                ) {
+                    regions.add(region)
+                }
+            }
+        }
+
+        /*
+         * The lowest valid region is the Play button on the
+         * main/result screen. This also avoids the Watch Video
+         * button above it.
+         */
+        return regions.maxByOrNull {
+            it.bottom
+        }
+    }
+
+    private fun isTargetColor(
+        color: Int,
+        kind: ColorKind
+    ): Boolean {
+
+        val r = Color.red(color)
+        val g = Color.green(color)
+        val b = Color.blue(color)
+
+        return when (kind) {
+
+            ColorKind.GREEN -> {
+                g >= 105 &&
+                    g > r * 1.12f &&
+                    g > b * 0.92f &&
+                    r < 150
+            }
+
+            ColorKind.BLUE -> {
+                b >= 105 &&
+                    b > r * 1.18f &&
+                    g > r * 1.05f &&
+                    b > g * 0.92f
+            }
+        }
+    }
+
+    private fun averageLuminance(
+        bitmap: Bitmap,
+        y0Fraction: Float,
+        y1Fraction: Float,
+        x0Fraction: Float,
+        x1Fraction: Float
+    ): Float {
+
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val x0 =
+            (width * x0Fraction).toInt()
+
+        val x1 =
+            (width * x1Fraction).toInt()
+
+        val y0 =
+            (height * y0Fraction).toInt()
+
+        val y1 =
+            (height * y1Fraction).toInt()
+
+        val step =
+            max(
+                8,
+                min(width, height) / 100
+            )
+
+        var total = 0L
+        var count = 0
+
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                total += luminance(
+                    bitmap.getPixel(x, y)
+                )
+                count++
+                x += step
+            }
+            y += step
+        }
+
+        return if (count == 0) {
+            0f
+        } else {
+            total.toFloat() / count
+        }
+    }
+
+    private fun whiteRatio(
+        bitmap: Bitmap,
+        y0Fraction: Float,
+        y1Fraction: Float,
+        x0Fraction: Float,
+        x1Fraction: Float
+    ): Float {
+
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val x0 =
+            (width * x0Fraction).toInt()
+
+        val x1 =
+            (width * x1Fraction).toInt()
+
+        val y0 =
+            (height * y0Fraction).toInt()
+
+        val y1 =
+            (height * y1Fraction).toInt()
+
+        val step =
+            max(
+                8,
+                min(width, height) / 100
+            )
+
+        var white = 0
+        var total = 0
+
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val c =
+                    bitmap.getPixel(x, y)
+
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+
+                if (
+                    r > 175 &&
+                    g > 175 &&
+                    b > 175
+                ) {
+                    white++
+                }
+
+                total++
+                x += step
+            }
+            y += step
+        }
+
+        return if (total == 0) {
+            0f
+        } else {
+            white.toFloat() / total
+        }
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * GAMEPLAY DETECTION
+     * ------------------------------------------------------------
+     */
+
+    private fun detectGameplayScore(
+        bitmap: Bitmap,
+        previous: Bitmap?
+    ): Float {
+
+        if (
+            bitmap.width < 200 ||
+            bitmap.height < 200
+        ) {
+            return 0f
+        }
+
+        val width = bitmap.width
+        val height = bitmap.height
+
+        /*
+         * Ignore top HUD and very bottom navigation area.
+         */
+        val y0 =
+            (height * 0.16f).toInt()
+
+        val y1 =
+            (height * 0.91f).toInt()
+
+        val stepX =
+            max(12, width / 45)
+
+        val stepY =
+            max(12, height / 55)
+
+        var samples = 0
+        var structural = 0
+        var motion = 0
+
+        var y = y0
+
+        while (y < y1) {
+            var x = stepX
+
+            while (x < width - stepX) {
+                val c =
+                    bitmap.getPixel(x, y)
+
+                val right =
+                    bitmap.getPixel(
+                        min(width - 1, x + stepX),
+                        y
+                    )
+
+                val down =
+                    bitmap.getPixel(
+                        x,
+                        min(height - 1, y + stepY)
+                    )
+
+                val l =
+                    luminance(c)
+
+                val lr =
+                    luminance(right)
+
+                val ld =
+                    luminance(down)
+
+                if (
+                    abs(l - lr) > 28 ||
+                    abs(l - ld) > 28
+                ) {
+                    structural++
+                }
+
+                if (
+                    previous != null &&
+                    x < previous.width &&
+                    y < previous.height
+                ) {
+                    val p =
+                        previous.getPixel(x, y)
+
+                    if (
+                        abs(
+                            l -
+                                luminance(p)
+                        ) > 24
+                    ) {
+                        motion++
+                    }
+                }
+
+                samples++
+                x += stepX
+            }
+
+            y += stepY
+        }
+
+        if (samples == 0) return 0f
+
+        val structuralRatio =
+            structural.toFloat() /
+                samples
+
+        val motionRatio =
+            motion.toFloat() /
+                samples
+
+        return (
+            structuralRatio * 0.35f +
+                motionRatio * 1.15f
+            ).coerceIn(0f, 1f)
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * GAME BRAIN
+     * ------------------------------------------------------------
+     *
+     * The critical improvement over the old brain:
+     *
+     * OLD:
+     *   "lane has edges/darkness/motion -> lane is dangerous"
+     *
+     * NEW:
+     *   "compare the same collision corridor across all 3 lanes"
+     *
+     * Camera movement affects all lanes. A real obstacle usually
+     * produces a stronger local signal in one lane.
+     */
+
+    private object GameBrain {
+
+        fun decide(
+            bitmap: Bitmap,
+            previous: Bitmap?,
+            currentLane: Int,
+            lastLaneChangeAt: Long,
+            now: Long,
+            random: Random
+        ): Decision? {
+
+            if (
+                bitmap.width < 300 ||
+                bitmap.height < 500
+            ) {
+                return null
+            }
+
+            val observations =
+                Array(3) { lane ->
+                    analyzeLane(
+                        bitmap,
+                        previous,
+                        lane
+                    )
+                }
+
+            val rawValues =
+                observations.map {
+                    it.rawRisk
+                }
+
+            val baseline =
+                median(rawValues)
+
+            val lanes =
+                observations.map {
+                    it.copy(
+                        risk = (
+                            0.50f +
+                                (it.rawRisk - baseline) *
+                                2.80f
+                            ).coerceIn(0f, 1f)
+                    )
+                }
+
+            val current =
+                lanes[currentLane]
+
+            val left =
+                if (currentLane > 0) {
+                    lanes[currentLane - 1]
+                } else {
+                    null
+                }
+
+            val right =
+                if (currentLane < 2) {
+                    lanes[currentLane + 1]
+                } else {
+                    null
+                }
+
+            val laneChangeAllowed =
+                now - lastLaneChangeAt >= 430L
+
+            /*
+             * SAFETY RULE 1:
+             * If the current lane is becoming dangerous and one adjacent
+             * lane is clearly safer, change early.
+             */
+            if (
+                laneChangeAllowed &&
+                current.risk >= 0.57f
+            ) {
+
+                val leftRisk =
+                    left?.risk ?: 1f
+
+                val rightRisk =
+                    right?.risk ?: 1f
+
+                val leftSafe =
+                    left != null &&
+                        leftRisk + 0.08f <
+                        current.risk
+
+                val rightSafe =
+                    right != null &&
+                        rightRisk + 0.08f <
+                        current.risk
+
+                if (leftSafe && rightSafe) {
+                    return if (
+                        leftRisk <= rightRisk
+                    ) {
+                        decision(
+                            Action.LEFT,
+                            current.risk,
+                            true,
+                            random
+                        )
+                    } else {
+                        decision(
+                            Action.RIGHT,
+                            current.risk,
+                            true,
+                            random
+                        )
+                    }
+                }
+
+                if (leftSafe) {
+                    return decision(
+                        Action.LEFT,
+                        current.risk,
+                        true,
+                        random
+                    )
+                }
+
+                if (rightSafe) {
+                    return decision(
+                        Action.RIGHT,
+                        current.risk,
+                        true,
+                        random
+                    )
+                }
+            }
+
+            /*
+             * SAFETY RULE 2:
+             * If collision risk is already high, choose the safest
+             * adjacent lane even when the difference is small.
+             */
+            if (
+                laneChangeAllowed &&
+                current.risk >= 0.72f
+            ) {
+
+                val leftRisk =
+                    left?.risk ?: 1f
+
+                val rightRisk =
+                    right?.risk ?: 1f
+
+                if (
+                    left != null &&
+                    leftRisk < current.risk
+                ) {
+                    if (
+                        right == null ||
+                        leftRisk <= rightRisk
+                    ) {
+                        return decision(
+                            Action.LEFT,
+                            current.risk,
+                            true,
+                            random
+                        )
+                    }
+                }
+
+                if (
+                    right != null &&
+                    rightRisk < current.risk
+                ) {
+                    return decision(
+                        Action.RIGHT,
+                        current.risk,
+                        true,
+                        random
+                    )
+                }
+            }
+
+            /*
+             * SAFETY RULE 3:
+             * If both lanes look bad, use a vertical action only when
+             * the image suggests a vertical collision is approaching.
+             *
+             * Lower-heavy structure -> jump.
+             * Upper/mid-heavy structure -> roll.
+             */
+            if (current.risk >= 0.66f) {
+
+                val lowerObstacle =
+                    current.nearEdge >
+                        current.midEdge + 0.035f
+
+                val upperObstacle =
+                    current.midEdge >
+                        current.nearEdge + 0.035f
+
+                if (
+                    lowerObstacle &&
+                    current.approach > 0.025f
+                ) {
+                    return decision(
+                        Action.JUMP,
+                        current.risk,
+                        false,
+                        random
+                    )
+                }
+
+                if (upperObstacle) {
+                    return decision(
+                        Action.ROLL,
+                        current.risk,
+                        false,
+                        random
+                    )
+                }
+            }
+
+            /*
+             * No convincing danger:
+             * stay in lane.
+             *
+             * This is important. A bot that moves every few hundred ms
+             * will eventually move into an obstacle.
+             */
+            return Decision(
+                action = Action.NONE,
+                confidence = 0.70f,
+                cooldownMs = 180L,
+                nextCaptureMs =
+                    82L +
+                        random.nextLong(0L, 28L),
+                gestureMs = 110L
+            )
+        }
+
+        private fun analyzeLane(
+            bitmap: Bitmap,
+            previous: Bitmap?,
+            lane: Int
+        ): LaneInfo {
+
+            val width = bitmap.width
+            val height = bitmap.height
+
+            /*
+             * Perspective lane windows.
+             * Narrower at the top, wider near the player.
+             */
+            val centerFractions =
+                floatArrayOf(
+                    0.27f,
+                    0.50f,
+                    0.73f
+                )
+
+            val centerX =
+                width *
+                    centerFractions[lane]
+
+            val laneHalfWidth =
+                width * 0.115f
+
+            val x0 =
+                max(
+                    0,
+                    (centerX - laneHalfWidth).toInt()
+                )
+
+            val x1 =
+                min(
+                    width,
+                    (centerX + laneHalfWidth).toInt()
+                )
+
+            /*
+             * Two collision bands:
+             *
+             * MID  = object is approaching
+             * NEAR = object is close to player
+             */
+            val mid =
+                bandMetrics(
+                    bitmap,
+                    previous,
+                    x0,
+                    x1,
+                    (height * 0.48f).toInt(),
+                    (height * 0.70f).toInt()
+                )
+
+            val near =
+                bandMetrics(
+                    bitmap,
+                    previous,
+                    x0,
+                    x1,
+                    (height * 0.70f).toInt(),
+                    (height * 0.89f).toInt()
+                )
+
+            /*
+             * Camera motion affects all lanes.
+             * Raw risk is only a relative signal.
+             */
+            val rawRisk =
+                near.motion * 0.48f +
+                    near.edge * 0.28f +
+                    near.strongEdge * 0.16f +
+                    mid.motion * 0.28f +
+                    mid.edge * 0.18f +
+                    near.darkness * 0.05f
+
+            val approach =
+                near.motion - mid.motion
+
+            return LaneInfo(
+                rawRisk = rawRisk.coerceIn(0f, 1f),
+                risk = 0f,
+                nearEdge = near.edge,
+                midEdge = mid.edge,
+                nearMotion = near.motion,
+                midMotion = mid.motion,
+                nearDark = near.darkness,
+                approach = approach
+            )
+        }
+
+        private fun bandMetrics(
+            bitmap: Bitmap,
+            previous: Bitmap?,
+            x0: Int,
+            x1: Int,
+            y0: Int,
+            y1: Int
+        ): BandMetrics {
+
+            val width = bitmap.width
+            val height = bitmap.height
+
+            val sx =
+                max(
+                    6,
+                    (x1 - x0) / 18
+                )
+
+            val sy =
+                max(
+                    7,
+                    (y1 - y0) / 18
+                )
+
+            var samples = 0
+            var edge = 0
+            var strongEdge = 0
+            var motion = 0
+            var dark = 0
+
+            var y = y0
+
+            while (y < y1) {
+                var x = x0 + sx / 2
+
+                while (x < x1) {
+                    val c =
+                        bitmap.getPixel(
+                            x,
+                            y
+                        )
+
+                    val right =
+                        bitmap.getPixel(
+                            min(
+                                width - 1,
+                                x + sx
+                            ),
+                            y
+                        )
+
+                    val down =
+                        bitmap.getPixel(
+                            x,
+                            min(
+                                height - 1,
+                                y + sy
+                            )
+                        )
+
+                    val l =
+                        luminance(c)
+
+                    val lr =
+                        luminance(right)
+
+                    val ld =
+                        luminance(down)
+
+                    val gradient =
+                        abs(l - lr) +
+                            abs(l - ld)
+
+                    if (gradient > 34) {
+                        edge++
+                    }
+
+                    if (gradient > 72) {
+                        strongEdge++
+                    }
+
+                    if (l < 58) {
+                        dark++
+                    }
+
+                    if (
+                        previous != null &&
+                        x < previous.width &&
+                        y < previous.height
+                    ) {
+                        val p =
+                            previous.getPixel(
+                                x,
+                                y
+                            )
+
+                        if (
+                            abs(
+                                l -
+                                    luminance(p)
+                            ) > 26
+                        ) {
+                            motion++
+                        }
+                    }
+
+                    samples++
+                    x += sx
+                }
+
+                y += sy
+            }
+
+            if (samples == 0) {
+                return BandMetrics(
+                    0f,
+                    0f,
+                    0f,
+                    0f
+                )
+            }
+
+            return BandMetrics(
+                edge =
+                    edge.toFloat() /
+                        samples,
+                strongEdge =
+                    strongEdge.toFloat() /
+                        samples,
+                motion =
+                    motion.toFloat() /
+                        samples,
+                darkness =
+                    dark.toFloat() /
+                        samples
+            )
+        }
+
+        private fun median(values: List<Float>): Float {
+            if (values.isEmpty()) return 0f
+
+            val sorted =
+                values.sorted()
+
+            return sorted[
+                sorted.size / 2
+            ]
+        }
+
+        private fun decision(
+            action: Action,
+            danger: Float,
+            laneChange: Boolean,
+            random: Random
+        ): Decision {
+
+            /*
+             * High danger = faster reaction.
+             * Small random variation preserves non-identical timing,
+             * but randomness never selects the direction.
+             */
+            val reaction =
+                if (danger >= 0.78f) {
+                    random.nextLong(72L, 125L)
+                } else if (danger >= 0.65f) {
+                    random.nextLong(90L, 155L)
+                } else {
+                    random.nextLong(110L, 190L)
+                }
+
+            val cooldown =
+                if (laneChange) {
+                    random.nextLong(210L, 300L)
+                } else {
+                    random.nextLong(180L, 260L)
+                }
+
+            val gesture =
+                random.nextLong(85L, 135L)
+
+            return Decision(
+                action = action,
+                confidence =
+                    danger.coerceIn(0f, 1f),
+                cooldownMs = cooldown,
+                nextCaptureMs = reaction,
+                gestureMs = gesture
+            )
+        }
+
+        private fun luminance(color: Int): Int {
+            return (
+                Color.red(color) * 299 +
+                    Color.green(color) * 587 +
+                    Color.blue(color) * 114
+                ) / 1000
+        }
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * GESTURE CONTROLLER
+     * ------------------------------------------------------------
      */
 
     private fun performDecision(
@@ -808,7 +1876,7 @@ class BotAccessibilityService : AccessibilityService() {
             SystemClock.elapsedRealtime()
 
         val centerY =
-            (height * 0.70f).toInt()
+            (height * 0.73f).toInt()
 
         val laneX =
             laneCenterX(
@@ -819,9 +1887,7 @@ class BotAccessibilityService : AccessibilityService() {
         when (decision.action) {
 
             Action.LEFT -> {
-
                 if (currentLane > 0) {
-
                     swipe(
                         laneX,
                         centerY,
@@ -834,30 +1900,12 @@ class BotAccessibilityService : AccessibilityService() {
                     )
 
                     currentLane--
-
-                } else {
-
-                    /*
-                     * Can't go left.
-                     *
-                     * Prefer vertical action
-                     * rather than wasting a
-                     * gesture.
-                     */
-                    swipe(
-                        laneX,
-                        centerY,
-                        laneX,
-                        (height * 0.42f).toInt(),
-                        decision.gestureMs
-                    )
+                    lastLaneChangeAt = now
                 }
             }
 
             Action.RIGHT -> {
-
                 if (currentLane < 2) {
-
                     swipe(
                         laneX,
                         centerY,
@@ -870,64 +1918,38 @@ class BotAccessibilityService : AccessibilityService() {
                     )
 
                     currentLane++
-
-                } else {
-
-                    swipe(
-                        laneX,
-                        centerY,
-                        laneX,
-                        (height * 0.42f).toInt(),
-                        decision.gestureMs
-                    )
+                    lastLaneChangeAt = now
                 }
             }
 
             Action.JUMP -> {
-
                 swipe(
                     laneX,
                     centerY,
                     laneX,
-                    (height * 0.38f).toInt(),
+                    (height * 0.37f).toInt(),
                     decision.gestureMs
                 )
             }
 
             Action.ROLL -> {
-
                 swipe(
                     laneX,
                     centerY,
                     laneX,
-                    (height * 0.91f).toInt(),
+                    (height * 0.92f).toInt(),
                     decision.gestureMs
                 )
             }
 
-            Action.HOVERBOARD -> {
-
-                /*
-                 * Subway Surfers hoverboard
-                 * activation is a double tap.
-                 */
-                doubleTap(
-                    laneX,
-                    centerY
-                )
-            }
-
             Action.TAP -> {
-
                 tap(
                     width / 2,
                     (height * 0.58f).toInt()
                 )
             }
 
-            Action.NONE -> {
-                return
-            }
+            Action.NONE -> return
         }
 
         lastActionAt = now
@@ -955,25 +1977,27 @@ class BotAccessibilityService : AccessibilityService() {
 
         val path =
             Path().apply {
-
                 moveTo(
                     x1.toFloat(),
                     y1.toFloat()
                 )
 
                 /*
-                 * Slightly curved movement
-                 * instead of perfectly straight
-                 * machine-like movement.
+                 * Slightly curved path.
+                 * Direction remains the actual decision.
                  */
-                quadTo(
-                    (
-                        (x1 + x2) / 2f
-                    ),
+                val controlX =
+                    (x1 + x2) / 2f
+
+                val controlY =
                     (
                         min(y1, y2) -
-                            abs(y2 - y1) * 0.08f
-                    ),
+                            abs(y2 - y1) * 0.06f
+                        )
+
+                quadTo(
+                    controlX,
+                    controlY,
                     x2.toFloat(),
                     y2.toFloat()
                 )
@@ -982,12 +2006,11 @@ class BotAccessibilityService : AccessibilityService() {
         val gesture =
             GestureDescription.Builder()
                 .addStroke(
-                    GestureDescription
-                        .StrokeDescription(
-                            path,
-                            0,
-                            duration
-                        )
+                    GestureDescription.StrokeDescription(
+                        path,
+                        0L,
+                        duration
+                    )
                 )
                 .build()
 
@@ -1014,12 +2037,11 @@ class BotAccessibilityService : AccessibilityService() {
         val gesture =
             GestureDescription.Builder()
                 .addStroke(
-                    GestureDescription
-                        .StrokeDescription(
-                            path,
-                            0,
-                            70L
-                        )
+                    GestureDescription.StrokeDescription(
+                        path,
+                        0L,
+                        60L
+                    )
                 )
                 .build()
 
@@ -1030,821 +2052,11 @@ class BotAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun doubleTap(
-        x: Int,
-        y: Int
-    ) {
-
-        val path1 =
-            Path().apply {
-                moveTo(
-                    x.toFloat(),
-                    y.toFloat()
-                )
-            }
-
-        val path2 =
-            Path().apply {
-                moveTo(
-                    x.toFloat(),
-                    y.toFloat()
-                )
-            }
-
-        val builder =
-            GestureDescription.Builder()
-
-        builder.addStroke(
-            GestureDescription
-                .StrokeDescription(
-                    path1,
-                    0L,
-                    55L
-                )
-        )
-
-        builder.addStroke(
-            GestureDescription
-                .StrokeDescription(
-                    path2,
-                    140L,
-                    55L
-                )
-        )
-
-        dispatchGesture(
-            builder.build(),
-            null,
-            null
-        )
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * GAMEPLAY DETECTION
-     * ---------------------------------------------------------
-     */
-
-    private fun detectGameplayScore(
-        bitmap: Bitmap,
-        previous: Bitmap?
-    ): Float {
-
-        if (
-            bitmap.width < 200 ||
-            bitmap.height < 200
-        ) {
-            return 0f
-        }
-
-        val width =
-            bitmap.width
-
-        val height =
-            bitmap.height
-
-        val y0 =
-            (height * 0.20f).toInt()
-
-        val y1 =
-            (height * 0.90f).toInt()
-
-        var samples = 0
-
-        var variation = 0
-
-        var previousDifference = 0
-
-        val stepX =
-            max(10, width / 40)
-
-        val stepY =
-            max(12, height / 45)
-
-        var y = y0
-
-        while (y < y1) {
-
-            var x = stepX
-
-            while (x < width - stepX) {
-
-                val c =
-                    bitmap.getPixel(x, y)
-
-                val right =
-                    bitmap.getPixel(
-                        min(
-                            width - 1,
-                            x + stepX
-                        ),
-                        y
-                    )
-
-                val down =
-                    bitmap.getPixel(
-                        x,
-                        min(
-                            height - 1,
-                            y + stepY
-                        )
-                    )
-
-                val l =
-                    luminance(c)
-
-                val lr =
-                    luminance(right)
-
-                val ld =
-                    luminance(down)
-
-                if (
-                    abs(l - lr) > 30 ||
-                    abs(l - ld) > 30
-                ) {
-                    variation++
-                }
-
-                if (
-                    previous != null &&
-                    x < previous.width &&
-                    y < previous.height
-                ) {
-
-                    val p =
-                        previous.getPixel(
-                            x,
-                            y
-                        )
-
-                    if (
-                        abs(
-                            l -
-                                luminance(p)
-                        ) > 25
-                    ) {
-                        previousDifference++
-                    }
-                }
-
-                samples++
-
-                x += stepX
-            }
-
-            y += stepY
-        }
-
-        if (samples == 0) {
-            return 0f
-        }
-
-        val structural =
-            variation.toFloat() /
-                samples.toFloat()
-
-        val movement =
-            previousDifference.toFloat() /
-                samples.toFloat()
-
-        return (
-            structural * 0.55f +
-                movement * 0.90f
-            ).coerceIn(
-                0f,
-                1f
-            )
-    }
-
-    private fun luminance(
-        color: Int
-    ): Int {
-
+    private fun luminance(color: Int): Int {
         return (
             Color.red(color) * 299 +
                 Color.green(color) * 587 +
                 Color.blue(color) * 114
             ) / 1000
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * GAME BRAIN
-     * ---------------------------------------------------------
-     */
-
-    private object GameBrain {
-
-        fun decide(
-            bitmap: Bitmap,
-            previous: Bitmap?,
-            currentLane: Int,
-            random: Random
-        ): Decision? {
-
-            if (
-                bitmap.width < 200 ||
-                bitmap.height < 200
-            ) {
-                return null
-            }
-
-            val lanes =
-                Array(3) {
-                    analyzeLane(
-                        bitmap,
-                        previous,
-                        it
-                    )
-                }
-
-            val current =
-                lanes[currentLane]
-
-            val left =
-                if (currentLane > 0) {
-                    lanes[currentLane - 1]
-                } else {
-                    null
-                }
-
-            val right =
-                if (currentLane < 2) {
-                    lanes[currentLane + 1]
-                } else {
-                    null
-                }
-
-            /*
-             * Strong danger in current lane.
-             */
-            if (current.risk > 0.68f) {
-
-                val leftSafe =
-                    left != null &&
-                        left.risk < 0.48f
-
-                val rightSafe =
-                    right != null &&
-                        right.risk < 0.48f
-
-                /*
-                 * Choose the safer adjacent lane.
-                 */
-                if (
-                    leftSafe &&
-                    rightSafe
-                ) {
-
-                    /*
-                     * Don't always choose
-                     * the numerically safer
-                     * lane if the difference
-                     * is tiny.
-                     */
-                    if (
-                        abs(
-                            left!!.risk -
-                                right!!.risk
-                        ) < 0.10f
-                    ) {
-
-                        return if (
-                            random.nextBoolean()
-                        ) {
-                            decision(
-                                Action.LEFT,
-                                0.76f,
-                                random
-                            )
-                        } else {
-                            decision(
-                                Action.RIGHT,
-                                0.76f,
-                                random
-                            )
-                        }
-                    }
-
-                    return if (
-                        left!!.risk <
-                            right!!.risk
-                    ) {
-                        decision(
-                            Action.LEFT,
-                            0.90f,
-                            random
-                        )
-                    } else {
-                        decision(
-                            Action.RIGHT,
-                            0.90f,
-                            random
-                        )
-                    }
-                }
-
-                if (leftSafe) {
-
-                    return decision(
-                        Action.LEFT,
-                        0.91f,
-                        random
-                    )
-                }
-
-                if (rightSafe) {
-
-                    return decision(
-                        Action.RIGHT,
-                        0.91f,
-                        random
-                    )
-                }
-
-                /*
-                 * No adjacent lane looks safe.
-                 *
-                 * Try a vertical movement.
-                 *
-                 * This is intentionally not
-                 * random every time.
-                 */
-                return if (
-                    current.edges >
-                        0.25f
-                ) {
-
-                    decision(
-                        Action.JUMP,
-                        0.72f,
-                        random
-                    )
-
-                } else {
-
-                    decision(
-                        Action.ROLL,
-                        0.65f,
-                        random
-                    )
-                }
-            }
-
-            /*
-             * Medium risk:
-             *
-             * Begin positioning before the
-             * obstacle becomes critical.
-             */
-            if (
-                current.risk > 0.50f
-            ) {
-
-                val safeLeft =
-                    left != null &&
-                        left.risk <
-                        current.risk - 0.08f
-
-                val safeRight =
-                    right != null &&
-                        right.risk <
-                        current.risk - 0.08f
-
-                if (
-                    safeLeft &&
-                    safeRight
-                ) {
-
-                    return if (
-                        left!!.risk <=
-                            right!!.risk
-                    ) {
-
-                        decision(
-                            Action.LEFT,
-                            0.71f,
-                            random
-                        )
-
-                    } else {
-
-                        decision(
-                            Action.RIGHT,
-                            0.71f,
-                            random
-                        )
-                    }
-                }
-
-                if (safeLeft) {
-
-                    return decision(
-                        Action.LEFT,
-                        0.73f,
-                        random
-                    )
-                }
-
-                if (safeRight) {
-
-                    return decision(
-                        Action.RIGHT,
-                        0.73f,
-                        random
-                    )
-                }
-            }
-
-            /*
-             * Low danger.
-             *
-             * Do NOT constantly move.
-             *
-             * Real gameplay needs periods
-             * of simply staying in a lane.
-             */
-            if (
-                current.risk < 0.34f
-            ) {
-
-                /*
-                 * Small probability of
-                 * repositioning if another
-                 * lane looks significantly
-                 * better.
-                 */
-                val betterLeft =
-                    left != null &&
-                        left.risk <
-                        current.risk - 0.18f
-
-                val betterRight =
-                    right != null &&
-                        right.risk <
-                        current.risk - 0.18f
-
-                if (
-                    betterLeft &&
-                    random.nextFloat() < 0.12f
-                ) {
-
-                    return decision(
-                        Action.LEFT,
-                        0.58f,
-                        random
-                    )
-                }
-
-                if (
-                    betterRight &&
-                    random.nextFloat() < 0.12f
-                ) {
-
-                    return decision(
-                        Action.RIGHT,
-                        0.58f,
-                        random
-                    )
-                }
-
-                return Decision(
-                    Action.NONE,
-                    0.50f,
-                    240L +
-                        random.nextLong(
-                            0,
-                            160
-                        ),
-                    130L +
-                        random.nextLong(
-                            0,
-                            80
-                        ),
-                    110L
-                )
-            }
-
-            /*
-             * Moderate uncertainty.
-             *
-             * Keep observing rather than
-             * making unnecessary movements.
-             */
-            return Decision(
-                Action.NONE,
-                0.45f,
-                220L +
-                    random.nextLong(
-                        0,
-                        120
-                    ),
-                130L +
-                    random.nextLong(
-                        0,
-                        80
-                    ),
-                110L
-            )
-        }
-
-        private fun analyzeLane(
-            bitmap: Bitmap,
-            previous: Bitmap?,
-            lane: Int
-        ): LaneInfo {
-
-            val width =
-                bitmap.width
-
-            val height =
-                bitmap.height
-
-            val x0 =
-                (width *
-                    (lane / 3.0)
-                ).toInt()
-
-            val x1 =
-                (width *
-                    ((lane + 1) / 3.0)
-                ).toInt()
-
-            /*
-             * The lower portion is more
-             * important because obstacles
-             * closer to the player appear
-             * there.
-             */
-            val y0 =
-                (height * 0.36f)
-                    .toInt()
-
-            val y1 =
-                (height * 0.88f)
-                    .toInt()
-
-            val stepX =
-                max(
-                    7,
-                    (x1 - x0) / 26
-                )
-
-            val stepY =
-                max(
-                    8,
-                    (y1 - y0) / 34
-                )
-
-            var samples = 0
-
-            var edgeCount = 0
-
-            var strongEdgeCount = 0
-
-            var darkCount = 0
-
-            var motionCount = 0
-
-            var brightnessTotal = 0
-
-            var y = y0
-
-            while (
-                y < y1 - stepY
-            ) {
-
-                var x =
-                    x0 + stepX
-
-                while (
-                    x < x1 - stepX
-                ) {
-
-                    val pixel =
-                        bitmap.getPixel(
-                            x,
-                            y
-                        )
-
-                    val right =
-                        bitmap.getPixel(
-                            min(
-                                width - 1,
-                                x + stepX
-                            ),
-                            y
-                        )
-
-                    val down =
-                        bitmap.getPixel(
-                            x,
-                            min(
-                                height - 1,
-                                y + stepY
-                            )
-                        )
-
-                    val lum =
-                        luminance(pixel)
-
-                    val rightLum =
-                        luminance(right)
-
-                    val downLum =
-                        luminance(down)
-
-                    val gradient =
-                        abs(
-                            lum -
-                                rightLum
-                        ) +
-                            abs(
-                                lum -
-                                    downLum
-                            )
-
-                    if (
-                        gradient > 38
-                    ) {
-                        edgeCount++
-                    }
-
-                    if (
-                        gradient > 76
-                    ) {
-                        strongEdgeCount++
-                    }
-
-                    if (
-                        lum < 55
-                    ) {
-                        darkCount++
-                    }
-
-                    brightnessTotal += lum
-
-                    if (
-                        previous != null &&
-                        x < previous.width &&
-                        y < previous.height
-                    ) {
-
-                        val previousPixel =
-                            previous.getPixel(
-                                x,
-                                y
-                            )
-
-                        val previousLum =
-                            luminance(
-                                previousPixel
-                            )
-
-                        if (
-                            abs(
-                                lum -
-                                    previousLum
-                            ) > 30
-                        ) {
-                            motionCount++
-                        }
-                    }
-
-                    samples++
-
-                    x += stepX
-                }
-
-                y += stepY
-            }
-
-            if (samples == 0) {
-
-                return LaneInfo(
-                    0f,
-                    0f,
-                    0f,
-                    0f,
-                    0f
-                )
-            }
-
-            val edges =
-                edgeCount.toFloat() /
-                    samples
-
-            val strongEdges =
-                strongEdgeCount.toFloat() /
-                    samples
-
-            val darkness =
-                darkCount.toFloat() /
-                    samples
-
-            val motion =
-                if (previous != null) {
-                    motionCount.toFloat() /
-                        samples
-                } else {
-                    0f
-                }
-
-            val brightness =
-                brightnessTotal.toFloat() /
-                    samples /
-                    255f
-
-            /*
-             * Risk isn't simply "dark = obstacle".
-             *
-             * Combine multiple visual signals.
-             */
-            val risk =
-                (
-                    edges * 0.38f +
-                        strongEdges * 0.24f +
-                        darkness * 0.12f +
-                        motion * 0.52f
-                    ).coerceIn(
-                        0f,
-                        1f
-                    )
-
-            return LaneInfo(
-                risk = risk,
-                motion = motion,
-                edges = edges,
-                darkness = darkness,
-                centerBrightness = brightness
-            )
-        }
-
-        private fun decision(
-            action: Action,
-            confidence: Float,
-            random: Random
-        ): Decision {
-
-            /*
-             * Human-like timing variation.
-             *
-             * Importantly, variation is applied
-             * AFTER the visual decision rather
-             * than replacing the decision.
-             */
-            val reaction =
-                when {
-                    confidence > 0.85f ->
-                        random.nextLong(
-                            120L,
-                            240L
-                        )
-
-                    confidence > 0.70f ->
-                        random.nextLong(
-                            170L,
-                            310L
-                        )
-
-                    else ->
-                        random.nextLong(
-                            220L,
-                            380L
-                        )
-                }
-
-            val cooldown =
-                random.nextLong(
-                    230L,
-                    410L
-                )
-
-            val gesture =
-                random.nextLong(
-                    90L,
-                    160L
-                )
-
-            return Decision(
-                action = action,
-                confidence = confidence,
-                cooldownMs = cooldown,
-                nextCaptureMs = reaction,
-                gestureMs = gesture
-            )
-        }
-
-        private fun luminance(
-            color: Int
-        ): Int {
-
-            return (
-                Color.red(color) * 299 +
-                    Color.green(color) * 587 +
-                    Color.blue(color) * 114
-                ) / 1000
-        }
     }
 }
