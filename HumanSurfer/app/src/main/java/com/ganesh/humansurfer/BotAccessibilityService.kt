@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -19,28 +20,39 @@ import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.random.Random
+import kotlin.math.sqrt
 
 /**
- * HumanSurfer controller.
+ * HumanSurfer controller (v6).
  *
- * This version is safety-first:
- * 1. Detects the important Subway Surfers UI screens visually.
- * 2. Uses accessibility text only as a secondary recovery path.
- * 3. Never uses a fixed prerecorded move sequence.
- * 4. Detects relative danger between the three lanes instead of
- *    treating every edge/motion in the scene as an obstacle.
- * 5. Reacts quickly when an approaching obstacle is detected.
+ * Control loop (one pass per screenshot):
  *
- * It is still a heuristic vision controller, not a trained game-specific
- * object detector. The thresholds are deliberately conservative.
+ *   OBSERVE   screenshot -> small working frame
+ *   PERCEIVE  track the runner, ray-cast the three lanes for obstacles
+ *   VERIFY    did the last lane / jump / roll gesture visibly happen?
+ *   PREDICT   time-to-collision per lane
+ *   DECIDE    GameBrain scores STAY / LEFT / RIGHT / JUMP
+ *   ACT       dispatchGesture() (never trusted as proof of movement)
+ *
+ * Invariants:
+ *  - currentLane is only ever written from a visual player estimate.
+ *    Sending a swipe only sets pendingLaneTarget.
+ *  - No gameplay gesture is sent unless the game is the foreground window,
+ *    the screen looks like gameplay, the runner is located with confidence
+ *    and no ad / popup is active.
+ *  - No randomness chooses a direction or an action.
+ *
+ * It is still a heuristic vision controller (no trained model). All
+ * geometry constants live in [Geo] so they can be tuned from real frames.
  */
 class BotAccessibilityService : AccessibilityService() {
 
     companion object {
         const val ACTION_STOP = "com.ganesh.humansurfer.STOP_BOT"
 
+        private const val TAG = "HumanSurfer"
         private const val GAME_PACKAGE = "com.kiloo.subwaysurf"
+        private const val PLAY_STORE_PACKAGE = "com.android.vending"
 
         private var instance: BotAccessibilityService? = null
         private var requestedDurationMinutes = 0
@@ -88,10 +100,7 @@ class BotAccessibilityService : AccessibilityService() {
 
     private data class Decision(
         val action: Action,
-        val confidence: Float,
-        val cooldownMs: Long,
-        val nextCaptureMs: Long,
-        val gestureMs: Long
+        val reason: String
     )
 
     private data class VisualRegion(
@@ -107,60 +116,145 @@ class BotAccessibilityService : AccessibilityService() {
         fun height(): Int = bottom - top
     }
 
-    private data class BandMetrics(
-        val edge: Float,
-        val strongEdge: Float,
-        val motion: Float,
-        val darkness: Float
-    )
-
-    private data class LaneInfo(
-        val rawRisk: Float,
-        val risk: Float,
-        val nearEdge: Float,
-        val midEdge: Float,
-        val nearMotion: Float,
-        val midMotion: Float,
-        val nearDark: Float,
-        val approach: Float,
-        val target: Float,
-        val hardBlock: Float
-    )
-
+    /** Runner estimate. All coordinates are fractions of the screen (0..1). */
     private data class PlayerEstimate(
         val lane: Int,
-        val centerX: Float,
+        val x: Float,
+        val y: Float,
+        val w: Float,
+        val h: Float,
         val confidence: Float
     )
 
-    private val handler = Handler(Looper.getMainLooper())
-    private val random = Random(System.currentTimeMillis())
+    /** Down-scaled working copy of a screenshot. */
+    private class SmallFrame(
+        val w: Int,
+        val h: Int,
+        val px: IntArray
+    )
 
+    /** What the ray-cast found in one lane. */
+    private class LaneScan {
+        var obstacleZ: Float = Geo.NO_OBSTACLE   // inverse-depth of nearest obstacle base
+        var kind: Int = Geo.KIND_NONE
+        var beside: Boolean = false              // obstacle already at the runner's row
+        var coins: Int = 0
+        var evaluated: Boolean = false
+    }
+
+    /**
+     * Image-space geometry. Depth is handled through z = 1 / (y - VANISH_Y):
+     * a static obstacle approaches at constant dz/dt, so time-to-collision is
+     * (z_obstacle - Z_NEAR) / speed regardless of how far away it is.
+     */
+    private object Geo {
+        const val SMALL_W = 240
+        const val STEPS = 40
+
+        const val VANISH_Y = 0.30f      // horizon row (fraction of height)
+        const val PLAYER_Y = 0.80f      // runner's feet row
+        const val FAR_OFFSET = 0.14f    // farthest scanned row = VANISH_Y + this
+
+        val Z_NEAR: Float = 1f / (PLAYER_Y - VANISH_Y)
+        val Z_FAR: Float = 1f / FAR_OFFSET
+
+        const val RAY_HALF_WIDTH = 0.05f   // fraction of width at the runner's row
+        const val RAY_HALF_HEIGHT = 0.010f
+
+        const val NO_OBSTACLE = 1.0e9f
+        const val KIND_NONE = 0
+        const val KIND_LOW = 1
+        const val KIND_TALL = 2
+
+        const val ANOMALY_DIST = 46f
+        const val DEFAULT_SPEED = 1.4f
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    // ---- loop / lifecycle state
     private var controllerActive = false
     private var state = BotState.WAITING_FOR_GAME
+    private var frameScheduled = false
 
     private var lastScreenshotAt = 0L
+    private var lastFrameAt = 0L
+    private var framePeriodMs = 350f
     private var lastActionAt = 0L
     private var lastStartTapAt = 0L
     private var lastPopupActionAt = 0L
+    private var lastPopupScanAt = 0L
     private var lastLaneChangeAt = 0L
     private var startGraceUntil = 0L
+    private var adActiveUntil = 0L
 
     private var lastFrame: Bitmap? = null
     private var previousFrame: Bitmap? = null
 
-    private var currentLane = 1
-    private var playerCenterX = 0f
-    private var playerConfidence = 0f
-    private var pendingLaneTarget: Int? = null
-    private var pendingLaneRequestedAt = 0L
-    private var pendingLaneAttempts = 0
-    private var gestureBusy = false
     private var missedFrames = 0
     private var gameForeground = false
+    private var lastForegroundCheckAt = 0L
+    private var lastForegroundPkg = ""
+    private var foregroundLostAt = 0L
+    private var externalBackCount = 0
+    private var lastExternalBackAt = 0L
     private var consecutiveGameplayFrames = 0
     private var consecutiveStaticFrames = 0
+    private var lowMotionScans = 0
     private var deathRecoveryCount = 0
+
+    // ---- runner tracking
+    private var currentLane = 1
+    private var playerCenterX = 0f          // fraction of width, 0 = unknown
+    private var playerCenterY = 0f          // fraction of height
+    private var playerConfidence = 0f
+    private var playerLocked = false
+    private var playerLostFrames = 0
+    private var playerStableFrames = 0
+    private val laneXN = floatArrayOf(0.27f, 0.50f, 0.73f)
+
+    private var tplValid = false
+    private var tplW = 0.12f
+    private var tplH = 0.15f
+    private var tplR = 0f
+    private var tplG = 0f
+    private var tplB = 0f
+    private var tplVotes = 0
+    private var groundY = 0f
+
+    // ---- gesture verification
+    private var pendingLaneTarget: Int? = null
+    private var pendingLaneOrigin = 1
+    private var pendingLaneRequestedAt = 0L
+    private var pendingLaneAttempts = 0
+    private var pendingLaneFrames = 0
+    private var gestureBusy = false
+    private var swipeBoost = 1.0f
+    private var laneMoveOk = 0
+    private var laneMoveFail = 0
+
+    private var pendingVertical: Action? = null
+    private var verticalRequestedAt = 0L
+    private var verticalSawChange = false
+    private var airborne = false
+    private var airborneSince = 0L
+    private var vertBoost = 1.0f
+    private var verticalFailStreak = 0
+
+    // ---- obstacle perception
+    private val refR = FloatArray(3 * Geo.STEPS)
+    private val refG = FloatArray(3 * Geo.STEPS)
+    private val refB = FloatArray(3 * Geo.STEPS)
+    private val refSet = BooleanArray(3 * Geo.STEPS)
+    private var framesSinceReset = 0
+    private var sceneChangeFrames = 0
+    private val prevObstZ = FloatArray(3) { Geo.NO_OBSTACLE }
+    private val prevObstAt = LongArray(3)
+    private var speedEst = Geo.DEFAULT_SPEED
+    private var lastSmall: SmallFrame? = null
+    private var screenW = 0
+    private var screenH = 0
+    private var lastVerticalAt = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -198,59 +292,35 @@ class BotAccessibilityService : AccessibilityService() {
 
         when {
             packageName == GAME_PACKAGE -> {
-                gameForeground = true
+                if (!gameForeground) {
+                    gameForeground = true
+                    foregroundLostAt = 0L
+                    externalBackCount = 0
+                }
                 if (enabled) beginController()
             }
 
-            packageName == "com.android.vending" -> {
-                // Google Play purchase UI opened by the game.
-                // Never interact with the purchase controls. Stop gameplay
-                // gestures and dismiss the external purchase sheet safely.
+            packageName == PLAY_STORE_PACKAGE -> {
+                // Purchase UI opened by the game. Never touch its controls:
+                // stop gameplay input; the loop presses BACK to leave it.
                 gameForeground = false
-                controllerActive = false
-                handler.removeCallbacksAndMessages(null)
-                state = BotState.RECOVERING
-                handler.postDelayed({ dismissExternalPurchaseUi() }, 180L)
+                lastForegroundPkg = packageName
+                suspendGameplay("google play opened")
+                if (foregroundLostAt == 0L) {
+                    foregroundLostAt = SystemClock.elapsedRealtime()
+                }
+                lastForegroundCheckAt = 0L
+                if (enabled) beginController()
             }
 
             else -> {
-                // Ignore incidental accessibility events from other packages.
-                // Only a real window switch means Subway Surfers lost focus.
+                // Incidental events (system UI, keyboard, toasts) must not
+                // kill the controller. Ask the polling check to re-verify.
                 if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                    gameForeground = false
-                    controllerActive = false
-                    handler.removeCallbacksAndMessages(null)
-                    state = BotState.WAITING_FOR_GAME
+                    lastForegroundCheckAt = 0L
                 }
             }
         }
-    }
-
-    private fun dismissExternalPurchaseUi() {
-        if (!enabled || durationExpired()) return
-
-        val root = rootInActiveWindow
-        if (root != null) {
-            val purchaseSignal = findNodeByTextOrDescription(
-                root,
-                listOf(
-                    "google play",
-                    "pay with",
-                    "payment method",
-                    "view all payment methods",
-                    "tap buy",
-                    "buy"
-                )
-            )
-            if (purchaseSignal != null) {
-                performGlobalAction(GLOBAL_ACTION_BACK)
-                return
-            }
-        }
-
-        // If the purchase sheet is still visible but its accessibility
-        // tree is sparse, a single BACK is still safer than clicking BUY.
-        performGlobalAction(GLOBAL_ACTION_BACK)
     }
 
     override fun onInterrupt() {
@@ -264,26 +334,150 @@ class BotAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    private fun resetSession() {
+    /**
+     * Polls the real foreground window. Events are only hints; this is the
+     * authority for "is Subway Surfers on screen?".
+     */
+    private fun refreshForeground(now: Long) {
+        if (now - lastForegroundCheckAt < 400L) return
+        lastForegroundCheckAt = now
+
+        val pkg: String? = try {
+            rootInActiveWindow?.packageName?.toString()
+        } catch (e: Exception) {
+            null
+        }
+
+        // Unknown (null) keeps the previous belief; some game windows expose
+        // no root node for a moment.
+        if (pkg == null) return
+
+        lastForegroundPkg = pkg
+
+        if (pkg == GAME_PACKAGE) {
+            if (!gameForeground) {
+                gameForeground = true
+            }
+            foregroundLostAt = 0L
+            externalBackCount = 0
+        } else if (gameForeground) {
+            gameForeground = false
+            suspendGameplay("foreground is $pkg")
+            if (foregroundLostAt == 0L) foregroundLostAt = now
+        }
+    }
+
+    /**
+     * Called while the game is not the foreground window. Sends no gameplay
+     * input. Leaves purchase / ad click-through screens with BACK only, and
+     * gives up completely if the game does not return.
+     */
+    private fun handleExternalWindow(now: Long) {
+        if (foregroundLostAt == 0L) foregroundLostAt = now
+
+        val pkg = lastForegroundPkg
+        val isOwnApp = pkg == packageName
+        val isSystemUi = pkg == "com.android.systemui"
+        val isPlay = pkg == PLAY_STORE_PACKAGE
+
+        if (now - foregroundLostAt > 45_000L) {
+            finishBot("Subway Surfers did not return to the foreground")
+            return
+        }
+
+        if (isOwnApp || isSystemUi || pkg.isEmpty()) return
+
+        // BACK inside the real game opens its pause / exit dialog, so only
+        // press it when the game has been gone for a while (or Play opened).
+        if (!isPlay && now - foregroundLostAt < 2500L) return
+
+        val limit = if (isPlay) 8 else 4
+        if (externalBackCount >= limit) {
+            finishBot("could not leave external screen: $pkg")
+            return
+        }
+
+        if (now - lastExternalBackAt >= 900L) {
+            lastExternalBackAt = now
+            externalBackCount++
+            Log.d(TAG, "BACK from $pkg (#$externalBackCount)")
+            performGlobalAction(GLOBAL_ACTION_BACK)
+        }
+    }
+
+    private fun suspendGameplay(reason: String) {
+        Log.d(TAG, "suspend gameplay: $reason")
+        clearPendingMotion()
+        gestureBusy = false
         state = BotState.WAITING_FOR_GAME
+        consecutiveGameplayFrames = 0
+        lowMotionScans = 0
+    }
+
+    private fun clearPendingMotion() {
+        pendingLaneTarget = null
+        pendingLaneAttempts = 0
+        pendingLaneFrames = 0
+        pendingVertical = null
+        verticalSawChange = false
+        airborne = false
+    }
+
+    /** Forget everything perceived about the scene and the runner. */
+    private fun resetPerception() {
+        clearPendingMotion()
+        gestureBusy = false
         currentLane = 1
         playerCenterX = 0f
+        playerCenterY = 0f
         playerConfidence = 0f
-        pendingLaneTarget = null
-        pendingLaneRequestedAt = 0L
-        pendingLaneAttempts = 0
-        gestureBusy = false
+        playerLocked = false
+        playerLostFrames = 0
+        playerStableFrames = 0
+        tplValid = false
+        tplVotes = 0
+        groundY = 0f
+        laneXN[0] = 0.27f
+        laneXN[1] = 0.50f
+        laneXN[2] = 0.73f
+        java.util.Arrays.fill(refSet, false)
+        framesSinceReset = 0
+        sceneChangeFrames = 0
+        for (i in 0 until 3) {
+            prevObstZ[i] = Geo.NO_OBSTACLE
+            prevObstAt[i] = 0L
+        }
+        speedEst = Geo.DEFAULT_SPEED
+        lastSmall = null
+    }
+
+    private fun resetSession() {
+        state = BotState.WAITING_FOR_GAME
+        resetPerception()
         missedFrames = 0
         consecutiveGameplayFrames = 0
         consecutiveStaticFrames = 0
+        lowMotionScans = 0
         deathRecoveryCount = 0
+        swipeBoost = 1.0f
+        vertBoost = 1.0f
+        laneMoveOk = 0
+        laneMoveFail = 0
+        verticalFailStreak = 0
+        externalBackCount = 0
+        gameForeground = false
+        foregroundLostAt = SystemClock.elapsedRealtime()
+        lastForegroundCheckAt = 0L
 
         lastScreenshotAt = 0L
+        lastFrameAt = 0L
         lastActionAt = 0L
         lastStartTapAt = 0L
         lastPopupActionAt = 0L
+        lastPopupScanAt = 0L
         lastLaneChangeAt = 0L
         startGraceUntil = 0L
+        adActiveUntil = 0L
 
         previousFrame?.recycle()
         previousFrame = null
@@ -303,15 +497,32 @@ class BotAccessibilityService : AccessibilityService() {
         controllerActive = false
         gameForeground = false
         state = BotState.STOPPED
+        gestureBusy = false
+        clearPendingMotion()
 
         previousFrame?.recycle()
         previousFrame = null
 
         lastFrame?.recycle()
         lastFrame = null
+        lastSmall = null
 
         missedFrames = 0
         handler.removeCallbacksAndMessages(null)
+    }
+
+    /** Ends the session for good (duration reached, unrecoverable screen). */
+    private fun finishBot(reason: String) {
+        Log.d(TAG, "bot finished: $reason")
+        enabled = false
+        try {
+            getSharedPreferences("human_surfer", MODE_PRIVATE)
+                .edit()
+                .putBoolean("bot_enabled", false)
+                .apply()
+        } catch (_: Exception) {
+        }
+        stopController()
     }
 
     private fun durationExpired(): Boolean {
@@ -328,15 +539,23 @@ class BotAccessibilityService : AccessibilityService() {
     }
 
     private fun captureNextFrame(delayMs: Long) {
-        if (!controllerActive || !enabled || durationExpired()) {
+        frameScheduled = true
+
+        if (!controllerActive || !enabled) {
             stopController()
+            return
+        }
+
+        if (durationExpired()) {
+            finishBot("duration reached")
             return
         }
 
         val now = SystemClock.elapsedRealtime()
 
-        // Fast enough to react to approaching obstacles.
-        val minimumFrameGap = 85L
+        // Android rate-limits takeScreenshot(); a too-early request simply
+        // fails with ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT and is retried.
+        val minimumFrameGap = 60L
 
         val wait = max(
             delayMs,
@@ -350,14 +569,23 @@ class BotAccessibilityService : AccessibilityService() {
     }
 
     private fun takeGameScreenshot() {
-        if (!controllerActive || !enabled || durationExpired()) {
+        if (!controllerActive || !enabled) {
             stopController()
             return
         }
 
+        if (durationExpired()) {
+            finishBot("duration reached")
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        refreshForeground(now)
+
         if (!gameForeground) {
             state = BotState.WAITING_FOR_GAME
-            captureNextFrame(350L)
+            handleExternalWindow(now)
+            if (controllerActive) captureNextFrame(350L)
             return
         }
 
@@ -366,7 +594,7 @@ class BotAccessibilityService : AccessibilityService() {
             return
         }
 
-        lastScreenshotAt = SystemClock.elapsedRealtime()
+        lastScreenshotAt = now
 
         takeScreenshot(
             Display.DEFAULT_DISPLAY,
@@ -402,15 +630,31 @@ class BotAccessibilityService : AccessibilityService() {
                         return
                     }
 
+                    val t = SystemClock.elapsedRealtime()
+
+                    if (lastFrameAt > 0L) {
+                        val dt = (t - lastFrameAt).toFloat()
+                        if (dt in 40f..1500f) {
+                            framePeriodMs = framePeriodMs * 0.8f + dt * 0.2f
+                        }
+                    }
+                    lastFrameAt = t
+
                     previousFrame?.recycle()
                     previousFrame = lastFrame
                     lastFrame = bitmap
                     missedFrames = 0
 
-                    processFrame(bitmap)
+                    processFrameSafely(bitmap, t)
                 }
 
                 override fun onFailure(errorCode: Int) {
+                    if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
+                        // Asked too soon. Not a real failure.
+                        captureNextFrame(40L)
+                        return
+                    }
+
                     missedFrames++
 
                     captureNextFrame(
@@ -421,93 +665,122 @@ class BotAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun processFrame(bitmap: Bitmap) {
+    private fun processFrameSafely(bitmap: Bitmap, now: Long) {
+        frameScheduled = false
+
+        try {
+            processFrame(bitmap, now)
+        } catch (e: Exception) {
+            Log.e(TAG, "frame processing failed", e)
+        }
+
+        if (!frameScheduled && controllerActive) {
+            captureNextFrame(150L)
+        }
+    }
+
+    private fun processFrame(bitmap: Bitmap, now: Long) {
         if (!gameForeground) {
             state = BotState.WAITING_FOR_GAME
             captureNextFrame(350L)
             return
         }
 
-        val mode = detectScreenMode(bitmap, previousFrame)
+        screenW = bitmap.width
+        screenH = bitmap.height
 
-        updatePlayerTracking(bitmap)
-        verifyPendingLaneChange(bitmap)
-
-        /*
-         * AD HANDLING HAS PRIORITY OVER GAMEPLAY.
-         *
-         * An interstitial/reward ad can visually cover the game while the
-         * package name is still Subway Surfers. Never send a jump/swipe
-         * through an ad. First look for explicit Skip/Close controls.
-         */
-        if (handleAdvertisementControls(bitmap)) {
-            captureNextFrame(180L)
-            return
-        }
+        val playing = state == BotState.PLAYING
 
         /*
-         * IMPORTANT:
-         * Visual recovery is checked BEFORE gameplay decisions.
-         *
-         * This fixes the Continue?/result screens from the screenshots.
+         * Screen understanding (popups, ads, menus) walks the accessibility
+         * tree and samples the whole bitmap. While the runner is alive that
+         * is far too slow to do every frame, so during gameplay it runs
+         * periodically; outside gameplay it runs every frame.
          */
-        if (handleVisualScreen(mode, bitmap)) {
-            captureNextFrame(180L)
-            return
-        }
+        val scanDue = !playing || now - lastPopupScanAt >= 600L
 
-        /*
-         * Accessibility recovery is secondary because many game
-         * controls are rendered on a canvas and expose no text.
-         */
-        if (handleAccessibilityControls()) {
-            state = BotState.RECOVERING
-            captureNextFrame(180L)
-            return
-        }
+        if (scanDue) {
+            lastPopupScanAt = now
 
-        if (mode == ScreenMode.PLAY_OR_RESULT) {
-            // The visual handler normally consumes this.
-            // Keep observing instead of making a blind center tap.
-            captureNextFrame(150L)
-            return
-        }
+            val mode = detectScreenMode(bitmap, previousFrame)
 
-        val gameplayScore =
-            detectGameplayScore(bitmap, previousFrame)
+            // Ads have priority over gameplay: never swipe through an ad.
+            if (handleAdvertisementControls(bitmap)) {
+                captureNextFrame(180L)
+                return
+            }
 
-        if (mode == ScreenMode.GAMEPLAY ||
-            state == BotState.STARTING ||
-            gameplayScore > 0.16f
-        ) {
-            consecutiveGameplayFrames++
-            consecutiveStaticFrames = 0
-        } else {
-            consecutiveStaticFrames++
-            consecutiveGameplayFrames = 0
-        }
+            // Visual recovery (Continue?, red X, PLAY) before any gameplay.
+            if (handleVisualScreen(mode, bitmap)) {
+                captureNextFrame(180L)
+                return
+            }
 
-        if (consecutiveGameplayFrames >= 2 ||
-            state == BotState.STARTING
-        ) {
-            if (state != BotState.PLAYING &&
-                state != BotState.RECOVERING
-            ) {
-                state = BotState.PLAYING
+            if (handleAccessibilityControls()) {
+                state = BotState.RECOVERING
+                captureNextFrame(180L)
+                return
+            }
+
+            if (mode == ScreenMode.PLAY_OR_RESULT) {
+                captureNextFrame(150L)
+                return
+            }
+
+            val gameplayScore = detectGameplayScore(bitmap, previousFrame)
+            val moving = gameplayScore > 0.16f
+
+            if (playing) {
+                // A frozen picture while "playing" means a popup, a pause
+                // or a death screen. Hand control back to recovery.
+                if (moving) lowMotionScans = 0 else lowMotionScans++
+
+                if (lowMotionScans >= 3) {
+                    Log.d(TAG, "picture frozen -> recovery")
+                    clearPendingMotion()
+                    gestureBusy = false
+                    state = BotState.RECOVERING
+                    consecutiveGameplayFrames = 0
+                    lowMotionScans = 0
+                }
+            } else {
+                if (mode == ScreenMode.GAMEPLAY ||
+                    state == BotState.STARTING ||
+                    moving
+                ) {
+                    consecutiveGameplayFrames++
+                    consecutiveStaticFrames = 0
+                } else {
+                    consecutiveStaticFrames++
+                    consecutiveGameplayFrames = 0
+                }
+
+                /*
+                 * RECOVERING must be able to return to PLAYING. Without this
+                 * the bot stayed idle forever after the first closed popup,
+                 * continued run, or dismissed ad.
+                 */
+                val needed = if (state == BotState.RECOVERING) 3 else 2
+                val calm =
+                    now - lastPopupActionAt > 1200L && now >= adActiveUntil
+
+                if (state == BotState.STARTING ||
+                    (consecutiveGameplayFrames >= needed && calm)
+                ) {
+                    state = BotState.PLAYING
+                    lowMotionScans = 0
+                    Log.d(TAG, "state -> PLAYING")
+                }
             }
         }
 
-        /*
-         * After pressing PLAY, give the runner only a short grace period.
-         * The old implementation could wait several seconds before the
-         * first real decision, which is too late for early obstacles.
-         */
-        val now = SystemClock.elapsedRealtime()
-
-        if (state == BotState.STARTING &&
-            now < startGraceUntil
-        ) {
-            captureNextFrame(90L)
+        if (now < adActiveUntil) {
+            // An advertisement is on screen and could not be closed.
+            if (state == BotState.PLAYING) {
+                clearPendingMotion()
+                state = BotState.RECOVERING
+            }
+            captureNextFrame(200L)
             return
         }
 
@@ -516,222 +789,752 @@ class BotAccessibilityService : AccessibilityService() {
             return
         }
 
-        // If we cannot locate the runner with reasonable confidence, do not
-        // invent a lane and do not send a blind gesture. Re-observe quickly.
-        if (playerConfidence < 0.34f) {
-            captureNextFrame(75L)
+        if (now < startGraceUntil) {
+            captureNextFrame(90L)
             return
         }
 
-        val decision =
-            GameBrain.decide(
-                bitmap = bitmap,
-                previous = previousFrame,
-                currentLane = currentLane,
-                lastLaneChangeAt = lastLaneChangeAt,
-                now = now,
-                random = random
-            )
+        // ---- OBSERVE -> PERCEIVE
+        val small = toSmall(bitmap)
+        val estimate = trackPlayer(small, now)
 
-        if (decision != null) {
-            if (now - lastActionAt >= decision.cooldownMs) {
-                performDecision(
-                    decision,
-                    bitmap.width,
-                    bitmap.height
-                )
-            }
+        // ---- VERIFY what the last gesture actually did
+        verifyPendingLaneChange(estimate, now)
+        verifyVertical(estimate, now)
 
-            captureNextFrame(decision.nextCaptureMs)
-        } else {
-            captureNextFrame(95L)
+        framesSinceReset++
+
+        // Without a confident, locked runner position there is no valid
+        // lane state. Do not invent one and do not swipe.
+        if (!playerLocked || playerConfidence < 0.40f) {
+            lastSmall = small
+            captureNextFrame(40L)
+            return
         }
+
+        val scans = perceive(small, now)
+        lastSmall = small
+
+        if (scans == null) {
+            captureNextFrame(40L)
+            return
+        }
+
+        // ---- PREDICT + DECIDE
+        val decision = GameBrain.decide(
+            scans = scans,
+            lane = currentLane,
+            speed = speedEst,
+            framePeriodSec = framePeriodMs / 1000f,
+            now = now,
+            lastLaneChangeAt = lastLaneChangeAt,
+            laneBusy = pendingLaneTarget != null || gestureBusy,
+            airborne = airborne || pendingVertical != null
+        )
+
+        // ---- ACT
+        if (decision.action != Action.NONE) {
+            performDecision(decision, bitmap.width, bitmap.height, now)
+        }
+
+        captureNextFrame(40L)
     }
 
     /*
      * ------------------------------------------------------------
-     * PLAYER TRACKING / ACTION VERIFICATION
+     * PERCEPTION
      * ------------------------------------------------------------
      */
 
-    private fun updatePlayerTracking(bitmap: Bitmap) {
-        val estimate = estimatePlayer(bitmap)
-        if (estimate != null && estimate.confidence >= 0.34f) {
-            playerCenterX = estimate.centerX
-            playerConfidence = estimate.confidence
-            if (pendingLaneTarget == null) {
-                currentLane = estimate.lane
-            }
-        } else {
-            playerConfidence *= 0.82f
-        }
+    private fun toSmall(bitmap: Bitmap): SmallFrame {
+        val sw = Geo.SMALL_W
+        val sh = max(
+            120,
+            (bitmap.height.toLong() * sw / max(1, bitmap.width)).toInt()
+        )
+
+        val scaled = Bitmap.createScaledBitmap(bitmap, sw, sh, true)
+        val px = IntArray(sw * sh)
+        scaled.getPixels(px, 0, sw, 0, 0, sw, sh)
+
+        if (scaled !== bitmap) scaled.recycle()
+
+        return SmallFrame(sw, sh, px)
     }
 
-    private fun verifyPendingLaneChange(bitmap: Bitmap) {
+    private fun nearestLane(x: Float): Int {
+        var best = 1
+        var bestD = Float.MAX_VALUE
+        for (l in 0..2) {
+            val d = abs(x - laneXN[l])
+            if (d < bestD) {
+                bestD = d
+                best = l
+            }
+        }
+        return best
+    }
+
+    private fun laneSpacing(): Float = (laneXN[2] - laneXN[0]) / 2f
+
+    /**
+     * Finds the runner. Candidates are compact saturated blobs in the lower
+     * play area. They are scored on size (against a template learned from
+     * the runner itself), distance from the last known position, fill, colour
+     * similarity with the template and vertical position. Blobs much larger
+     * than the runner (trains) are rejected, which a pure "biggest colourful
+     * blob" detector gets wrong exactly when a train is next to the runner.
+     */
+    private fun trackPlayer(f: SmallFrame, now: Long): PlayerEstimate? {
+        val w = f.w
+        val h = f.h
+        val x0 = (w * 0.08f).toInt()
+        val x1 = (w * 0.92f).toInt()
+        val y0 = (h * 0.48f).toInt()
+        val y1 = (h * 0.96f).toInt()
+        val cw = x1 - x0
+        val ch = y1 - y0
+        if (cw < 20 || ch < 20) return null
+
+        val active = BooleanArray(cw * ch)
+
+        for (yy in 0 until ch) {
+            val row = (y0 + yy) * w + x0
+            for (xx in 0 until cw) {
+                val c = f.px[row + xx]
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+                val mx = max(r, max(g, b))
+                if (mx < 40) continue
+                val mn = min(r, min(g, b))
+                val sat = (mx - mn).toFloat() / mx
+                val lum = (r * 299 + g * 587 + b * 114) / 1000
+                active[yy * cw + xx] = sat > 0.20f && lum in 25..240
+            }
+        }
+
+        // Close 1-pixel gaps so a runner split by dark clothing stays whole.
+        val mask = BooleanArray(active.size)
+        for (yy in 0 until ch) {
+            for (xx in 0 until cw) {
+                val i = yy * cw + xx
+                mask[i] = active[i] ||
+                    (xx > 0 && active[i - 1]) ||
+                    (xx < cw - 1 && active[i + 1]) ||
+                    (yy > 0 && active[i - cw]) ||
+                    (yy < ch - 1 && active[i + cw])
+            }
+        }
+
+        val visited = BooleanArray(mask.size)
+        val queue = IntArray(mask.size)
+
+        var bestScore = -1f
+        var bestX = 0f
+        var bestY = 0f
+        var bestW = 0f
+        var bestH = 0f
+        var bestR = 0f
+        var bestG = 0f
+        var bestB = 0f
+
+        val transit = pendingLaneTarget != null
+
+        for (start in mask.indices) {
+            if (!mask[start] || visited[start]) continue
+
+            var head = 0
+            var tail = 0
+            queue[tail++] = start
+            visited[start] = true
+
+            var minX = cw
+            var maxX = -1
+            var minY = ch
+            var maxY = -1
+            var count = 0
+            var sr = 0L
+            var sg = 0L
+            var sb = 0L
+
+            while (head < tail) {
+                val cur = queue[head++]
+                val cx = cur % cw
+                val cy = cur / cw
+                count++
+                if (cx < minX) minX = cx
+                if (cx > maxX) maxX = cx
+                if (cy < minY) minY = cy
+                if (cy > maxY) maxY = cy
+
+                val c = f.px[(y0 + cy) * w + x0 + cx]
+                sr += (c shr 16) and 0xFF
+                sg += (c shr 8) and 0xFF
+                sb += c and 0xFF
+
+                if (cx > 0) {
+                    val n = cur - 1
+                    if (mask[n] && !visited[n]) {
+                        visited[n] = true
+                        queue[tail++] = n
+                    }
+                }
+                if (cx < cw - 1) {
+                    val n = cur + 1
+                    if (mask[n] && !visited[n]) {
+                        visited[n] = true
+                        queue[tail++] = n
+                    }
+                }
+                if (cy > 0) {
+                    val n = cur - cw
+                    if (mask[n] && !visited[n]) {
+                        visited[n] = true
+                        queue[tail++] = n
+                    }
+                }
+                if (cy < ch - 1) {
+                    val n = cur + cw
+                    if (mask[n] && !visited[n]) {
+                        visited[n] = true
+                        queue[tail++] = n
+                    }
+                }
+            }
+
+            if (count < 30) continue
+
+            val bw = (maxX - minX + 1).toFloat() / w
+            val bh = (maxY - minY + 1).toFloat() / h
+            if (bw < 0.035f || bw > 0.32f || bh < 0.045f || bh > 0.30f) continue
+
+            // Anything far larger than the runner is a train / wall.
+            if (tplValid && (bw > tplW * 2.0f || bh > tplH * 2.0f)) continue
+
+            val cxN = (x0 + (minX + maxX + 1) / 2f) / w
+            val cyN = (y0 + (minY + maxY + 1) / 2f) / h
+            val fill = count.toFloat() /
+                ((maxX - minX + 1) * (maxY - minY + 1)).toFloat()
+
+            val mr = sr.toFloat() / count
+            val mg = sg.toFloat() / count
+            val mb = sb.toFloat() / count
+
+            val sizeScore: Float = if (tplValid) {
+                val dw = abs(bw - tplW) / tplW
+                val dh = abs(bh - tplH) / tplH
+                1f - min(1f, (dw + dh) / 1.4f)
+            } else {
+                val dw = abs(bw - 0.12f) / 0.12f
+                val dh = abs(bh - 0.15f) / 0.15f
+                1f - min(1f, (dw + dh) / 1.8f)
+            }
+
+            val prox: Float = if (playerLocked && playerCenterX > 0f) {
+                val sx = if (transit) 0.30f else 0.16f
+                val dx = (cxN - playerCenterX) / sx
+                val dy = (cyN - playerCenterY) / 0.12f
+                1f / (1f + dx * dx + dy * dy)
+            } else {
+                val dx = (cxN - 0.5f) / 0.30f
+                val dy = (cyN - 0.78f) / 0.15f
+                1f / (1f + dx * dx + dy * dy)
+            }
+
+            val colorScore: Float = if (tplValid) {
+                val dr = mr - tplR
+                val dg = mg - tplG
+                val db = mb - tplB
+                1f - min(1f, sqrt(dr * dr + dg * dg + db * db) / 110f)
+            } else {
+                0.5f
+            }
+
+            val lowerBias = 1f - min(1f, abs(cyN - 0.78f) / 0.30f)
+
+            val score =
+                0.28f * sizeScore +
+                    0.30f * prox +
+                    0.12f * fill +
+                    0.18f * colorScore +
+                    0.12f * lowerBias
+
+            if (score > bestScore) {
+                bestScore = score
+                bestX = cxN
+                bestY = cyN
+                bestW = bw
+                bestH = bh
+                bestR = mr
+                bestG = mg
+                bestB = mb
+            }
+        }
+
+        val conf = ((bestScore - 0.38f) / 0.50f).coerceIn(0f, 1f)
+
+        if (bestScore < 0f || conf < 0.30f) {
+            playerLostFrames++
+            playerConfidence *= 0.7f
+            if (playerLostFrames >= 6) {
+                playerLocked = false
+                playerStableFrames = 0
+            }
+            return null
+        }
+
+        val consistent = playerCenterX <= 0f ||
+            abs(bestX - playerCenterX) < (if (transit) 0.34f else 0.16f)
+
+        if (consistent) playerStableFrames++ else playerStableFrames = 1
+
+        playerLostFrames = 0
+        playerCenterX = bestX
+        playerCenterY = bestY
+        playerConfidence = conf
+
+        if (!playerLocked && playerStableFrames >= 2 && conf >= 0.40f) {
+            playerLocked = true
+        }
+
+        val lane = nearestLane(bestX)
+
+        if (pendingLaneTarget == null && playerLocked) {
+            currentLane = lane
+        }
+
+        val settled =
+            pendingLaneTarget == null &&
+                pendingVertical == null &&
+                !airborne &&
+                now - lastVerticalAt > 900L
+
+        if (conf >= 0.55f && settled) {
+            if (!tplValid) {
+                if (abs(bestX - 0.5f) < 0.12f && bestY in 0.60f..0.92f) {
+                    tplVotes++
+                    if (tplVotes >= 3) {
+                        tplValid = true
+                        tplW = bestW
+                        tplH = bestH
+                        tplR = bestR
+                        tplG = bestG
+                        tplB = bestB
+                    }
+                }
+            } else {
+                tplW = tplW * 0.92f + bestW * 0.08f
+                tplH = tplH * 0.92f + bestH * 0.08f
+                tplR = tplR * 0.92f + bestR * 0.08f
+                tplG = tplG * 0.92f + bestG * 0.08f
+                tplB = tplB * 0.92f + bestB * 0.08f
+            }
+
+            groundY =
+                if (groundY <= 0f) bestY else groundY * 0.9f + bestY * 0.1f
+
+            // Learn where each lane really is at the runner's row.
+            if (playerStableFrames >= 3 && conf >= 0.60f) {
+                val defaults = floatArrayOf(0.27f, 0.50f, 0.73f)
+                val learned = laneXN[lane] * 0.92f + bestX * 0.08f
+                laneXN[lane] = learned.coerceIn(
+                    defaults[lane] - 0.07f,
+                    defaults[lane] + 0.07f
+                )
+            }
+        }
+
+        return PlayerEstimate(lane, bestX, bestY, bestW, bestH, conf)
+    }
+
+    /**
+     * A swipe is only a request. This checks the following frames and only
+     * then accepts, retries once, or gives up. currentLane is never set here
+     * from the request, only from what the runner visibly did.
+     */
+    private fun verifyPendingLaneChange(est: PlayerEstimate?, now: Long) {
         val target = pendingLaneTarget ?: return
-        val now = SystemClock.elapsedRealtime()
-        val estimate = estimatePlayer(bitmap)
+        val elapsed = now - pendingLaneRequestedAt
+        val spacing = laneSpacing()
 
-        if (estimate != null && estimate.confidence >= 0.36f) {
-            playerCenterX = estimate.centerX
-            playerConfidence = estimate.confidence
+        if (est != null && est.confidence >= 0.40f) {
+            pendingLaneFrames++
 
-            if (estimate.lane == target) {
+            val offTarget = abs(est.x - laneXN[target])
+            val offOrigin = abs(est.x - laneXN[pendingLaneOrigin])
+
+            if (est.lane == target && offTarget < spacing * 0.45f) {
                 currentLane = target
                 pendingLaneTarget = null
                 pendingLaneAttempts = 0
+                pendingLaneFrames = 0
                 lastLaneChangeAt = now
-                gestureBusy = false
+                laneMoveOk++
+                swipeBoost = max(1.0f, swipeBoost - 0.05f)
+                Log.d(TAG, "lane change CONFIRMED -> $target in ${elapsed}ms")
+                return
+            }
+
+            val stillAtOrigin =
+                est.lane == pendingLaneOrigin && offOrigin < spacing * 0.30f
+
+            if (stillAtOrigin && elapsed >= 420L && pendingLaneFrames >= 2) {
+                handleLaneMoveFailure(est, now, true)
                 return
             }
         }
 
-        if (now - pendingLaneRequestedAt < 260L) return
+        if (elapsed >= 1000L) {
+            handleLaneMoveFailure(est, now, false)
+        }
+    }
 
-        if (pendingLaneAttempts < 1 && gameForeground && controllerActive) {
+    private fun handleLaneMoveFailure(
+        est: PlayerEstimate?,
+        now: Long,
+        seenAtOrigin: Boolean
+    ) {
+        val target = pendingLaneTarget ?: return
+
+        laneMoveFail++
+        swipeBoost = min(1.35f, swipeBoost + 0.10f)
+
+        // Retry exactly once, and only when the runner was seen in the
+        // original lane (an unseen runner might already have moved, and a
+        // second swipe could overshoot).
+        if (seenAtOrigin &&
+            pendingLaneAttempts < 1 &&
+            gameForeground &&
+            controllerActive &&
+            !gestureBusy &&
+            screenW > 0
+        ) {
             pendingLaneAttempts++
             pendingLaneRequestedAt = now
+            pendingLaneFrames = 0
             gestureBusy = true
-            val direction = if (target > currentLane) 1 else -1
-            dispatchHorizontalSwipe(
-                direction = direction,
-                width = bitmap.width,
-                height = bitmap.height,
-                duration = 105L
-            )
+            val dir = if (target > pendingLaneOrigin) 1 else -1
+            Log.w(TAG, "lane change NOT visible, retrying once (dir=$dir)")
+            dispatchHorizontalSwipe(dir, screenW, screenH)
             return
         }
 
-        // The gesture did not produce a visually confirmed lane change.
-        // Never update our internal lane just because dispatchGesture returned.
+        Log.w(TAG, "lane change FAILED, keeping visual lane")
         pendingLaneTarget = null
         pendingLaneAttempts = 0
-        gestureBusy = false
+        pendingLaneFrames = 0
         lastLaneChangeAt = now
+        if (est != null && est.confidence >= 0.40f) {
+            currentLane = est.lane
+        }
     }
 
-    private fun estimatePlayer(bitmap: Bitmap): PlayerEstimate? {
-        val width = bitmap.width
-        val height = bitmap.height
-        if (width < 300 || height < 500) return null
+    private fun verifyVertical(est: PlayerEstimate?, now: Long) {
+        val v = pendingVertical
 
-        val xMin = (width * 0.12f).toInt()
-        val xMax = (width * 0.88f).toInt()
-        val yMin = (height * 0.68f).toInt()
-        val yMax = (height * 0.96f).toInt()
+        if (v == null) {
+            if (airborne) {
+                val landed =
+                    est != null &&
+                        groundY > 0f &&
+                        est.y >= groundY - 0.015f &&
+                        now - airborneSince > 250L
 
-        val step = max(8, min(width, height) / 115)
-        val cols = max(1, (xMax - xMin) / step)
-        val rows = max(1, (yMax - yMin) / step)
-        val active = BooleanArray(cols * rows)
+                if (landed || now - airborneSince > 1100L) {
+                    airborne = false
+                }
+            }
+            return
+        }
 
-        fun idx(x: Int, y: Int) = y * cols + x
+        val elapsed = now - verticalRequestedAt
 
-        for (gy in 0 until rows) {
-            val py = min(height - 1, yMin + gy * step + step / 2)
-            for (gx in 0 until cols) {
-                val px = min(width - 1, xMin + gx * step + step / 2)
-                val c = bitmap.getPixel(px, py)
-                val r = Color.red(c)
-                val g = Color.green(c)
-                val b = Color.blue(c)
-                val mx = max(r, max(g, b))
-                val mn = min(r, min(g, b))
-                val sat = if (mx == 0) 0f else (mx - mn).toFloat() / mx
-                val lum = luminance(c)
+        if (est != null && est.confidence >= 0.40f && groundY > 0f) {
+            if (v == Action.JUMP && est.y < groundY - 0.030f) {
+                Log.d(TAG, "jump CONFIRMED")
+                pendingVertical = null
+                airborneSince = now
+                verticalFailStreak = 0
+                vertBoost = max(1.0f, vertBoost - 0.05f)
+                return
+            }
 
-                // The runner is a compact, high-contrast/saturated object in
-                // the lower central play corridor. Rails and track are much
-                // more repetitive and usually have lower saturation.
-                active[idx(gx, gy)] =
-                    sat > 0.16f &&
-                    lum in 22..245
+            if (v == Action.ROLL &&
+                (est.h < tplH * 0.82f || est.y > groundY + 0.015f)
+            ) {
+                Log.d(TAG, "roll CONFIRMED")
+                pendingVertical = null
+                verticalFailStreak = 0
+                vertBoost = max(1.0f, vertBoost - 0.05f)
+                return
             }
         }
 
-        val visited = BooleanArray(active.size)
-        val queue = ArrayDeque<Int>()
-        var best: VisualRegion? = null
-        var bestScore = 0f
+        if (elapsed >= 700L) {
+            verticalFailStreak++
+            vertBoost = min(1.4f, vertBoost + 0.10f)
+            Log.w(TAG, "$v not visible after ${elapsed}ms (fails=$verticalFailStreak)")
+            pendingVertical = null
+            if (v == Action.JUMP) airborne = false
+        }
+    }
 
-        for (gy in 0 until rows) {
-            for (gx in 0 until cols) {
-                val start = idx(gx, gy)
-                if (!active[start] || visited[start]) continue
-                queue.clear()
-                queue.addLast(start)
-                visited[start] = true
+    private fun zAt(i: Int): Float =
+        Geo.Z_NEAR + (Geo.Z_FAR - Geo.Z_NEAR) * i / (Geo.STEPS - 1)
 
-                var minX = gx
-                var maxX = gx
-                var minY = gy
-                var maxY = gy
-                var count = 0
+    /**
+     * Ray-casts the three lanes. For every lane a column of small patches is
+     * sampled along the lane centre line from the runner towards the horizon,
+     * evenly spaced in inverse depth. Each patch is compared with a learned
+     * "empty track" colour for that lane and distance. Patches that differ
+     * are obstacle candidates; short gold patches are coin lines.
+     *
+     * Returns null when the scene cannot be trusted (reference not ready, or
+     * the whole picture changed, e.g. tunnel / new world).
+     */
+    private fun perceive(f: SmallFrame, now: Long): Array<LaneScan>? {
+        val n = Geo.STEPS
+        val w = f.w
+        val h = f.h
 
-                while (queue.isNotEmpty()) {
-                    val cur = queue.removeFirst()
-                    val cx = cur % cols
-                    val cy = cur / cols
-                    count++
-                    minX = min(minX, cx)
-                    maxX = max(maxX, cx)
-                    minY = min(minY, cy)
-                    maxY = max(maxY, cy)
+        val pr = FloatArray(3 * n)
+        val pg = FloatArray(3 * n)
+        val pb = FloatArray(3 * n)
+        val gold = FloatArray(3 * n)
+        val usable = BooleanArray(3 * n)
 
-                    val ns = intArrayOf(
-                        cur - 1, cur + 1,
-                        cur - cols, cur + cols
-                    )
-                    for (n in ns) {
-                        if (n < 0 || n >= active.size || visited[n] || !active[n]) continue
-                        val nx = n % cols
-                        val ny = n / cols
-                        if (abs(nx - cx) + abs(ny - cy) != 1) continue
-                        visited[n] = true
-                        queue.addLast(n)
+        // Rows covered by the runner's own body cannot be read in his lane.
+        val bodyTop = playerCenterY - tplH * 0.5f - 0.02f
+        val pendingTarget = pendingLaneTarget
+
+        for (lane in 0..2) {
+            val occluded = lane == currentLane || lane == pendingTarget
+
+            for (i in 0 until n) {
+                val z = zAt(i)
+                val y = Geo.VANISH_Y + 1f / z
+                val s = Geo.Z_NEAR / z
+
+                if (occluded && y >= bodyTop) continue
+
+                val cx = 0.5f + (laneXN[lane] - 0.5f) * s
+                val hw = Geo.RAY_HALF_WIDTH * s
+                val hh = Geo.RAY_HALF_HEIGHT * s
+
+                val xa = max(0, ((cx - hw) * w).toInt())
+                val xb = min(w - 1, max(xa + 1, ((cx + hw) * w).toInt()))
+                val ya = max(0, ((y - hh) * h).toInt())
+                val yb = min(h - 1, max(ya + 1, ((y + hh) * h).toInt()))
+
+                var sr = 0
+                var sg = 0
+                var sb = 0
+                var gc = 0
+                var cnt = 0
+
+                for (yy in ya..yb) {
+                    val row = yy * w
+                    for (xx in xa..xb) {
+                        val c = f.px[row + xx]
+                        val r = (c shr 16) and 0xFF
+                        val g = (c shr 8) and 0xFF
+                        val b = c and 0xFF
+                        sr += r
+                        sg += g
+                        sb += b
+                        if (r > 170 && g > 110 && b < 90 && r - b > 90) gc++
+                        cnt++
                     }
                 }
 
-                val rw = (maxX - minX + 1) * step
-                val rh = (maxY - minY + 1) * step
-                if (count < 10 || rw < step * 2 || rh < step * 2) continue
-                if (rw > width * 0.42f || rh > height * 0.38f) continue
+                if (cnt == 0) continue
 
-                val centerX = xMin + (minX + maxX + 1) * step / 2f
-                val centerY = yMin + (minY + maxY + 1) * step / 2f
-                val area = rw.toFloat() * rh.toFloat()
-                val fill = count.toFloat() / max(1f, (rw.toFloat() / step) * (rh.toFloat() / step))
-                val lowerBonus = ((centerY / height.toFloat()) - 0.70f).coerceIn(0f, 0.25f)
-                val compactness = 1f - abs(1f - rw.toFloat() / max(1f, rh.toFloat())) * 0.35f
-                val score =
-                    count * 0.55f +
-                    fill * 20f +
-                    compactness * 8f +
-                    lowerBonus * 18f +
-                    (1f - abs(centerX / width.toFloat() - 0.5f)) * 6f
+                val k = lane * n + i
+                pr[k] = sr.toFloat() / cnt
+                pg[k] = sg.toFloat() / cnt
+                pb[k] = sb.toFloat() / cnt
+                gold[k] = gc.toFloat() / cnt
+                usable[k] = true
+            }
+        }
 
-                if (score > bestScore) {
-                    bestScore = score
-                    best = VisualRegion(
-                        (centerX - rw / 2f).toInt(),
-                        (centerY - rh / 2f).toInt(),
-                        (centerX + rw / 2f).toInt(),
-                        (centerY + rh / 2f).toInt(),
-                        count
-                    )
+        // Seed the empty-track reference where at least two lanes agree.
+        if (framesSinceReset >= 2) {
+            for (i in 0 until n) {
+                var bestA = -1
+                var bestB = -1
+                var bestD = Float.MAX_VALUE
+
+                for (a in 0..1) {
+                    for (b in (a + 1)..2) {
+                        val ka = a * n + i
+                        val kb = b * n + i
+                        if (!usable[ka] || !usable[kb]) continue
+                        val d = colorDist(
+                            pr[ka], pg[ka], pb[ka],
+                            pr[kb], pg[kb], pb[kb]
+                        )
+                        if (d < bestD) {
+                            bestD = d
+                            bestA = a
+                            bestB = b
+                        }
+                    }
+                }
+
+                if (bestA < 0 || bestD >= 28f) continue
+
+                val ka = bestA * n + i
+                val kb = bestB * n + i
+                val mr = (pr[ka] + pr[kb]) / 2f
+                val mg = (pg[ka] + pg[kb]) / 2f
+                val mb = (pb[ka] + pb[kb]) / 2f
+
+                for (lane in 0..2) {
+                    val k = lane * n + i
+                    if (!usable[k] || refSet[k]) continue
+                    val inPair = lane == bestA || lane == bestB
+                    refR[k] = if (inPair) pr[k] else mr
+                    refG[k] = if (inPair) pg[k] else mg
+                    refB[k] = if (inPair) pb[k] else mb
+                    refSet[k] = true
                 }
             }
         }
 
-        val region = best ?: return null
-        val centerX = region.centerX().toFloat()
-        val lane = when {
-            centerX < width * 0.385f -> 0
-            centerX > width * 0.615f -> 2
-            else -> 1
+        val anomalous = BooleanArray(3 * n)
+        var evaluatedCells = 0
+        var anomalousCells = 0
+
+        for (k in 0 until 3 * n) {
+            if (!usable[k] || !refSet[k]) continue
+            val d = colorDist(pr[k], pg[k], pb[k], refR[k], refG[k], refB[k])
+            evaluatedCells++
+            if (d > Geo.ANOMALY_DIST) {
+                anomalous[k] = true
+                anomalousCells++
+            } else if (d < 24f) {
+                // Empty track: let the reference follow slow lighting drift.
+                refR[k] = refR[k] * 0.94f + pr[k] * 0.06f
+                refG[k] = refG[k] * 0.94f + pg[k] * 0.06f
+                refB[k] = refB[k] * 0.94f + pb[k] * 0.06f
+            }
         }
-        val confidence = (bestScore / 42f).coerceIn(0f, 1f)
-        return PlayerEstimate(lane, centerX, confidence)
+
+        if (evaluatedCells < 24) return null
+
+        // Everything changed at once: new scene, not 40 obstacles.
+        if (anomalousCells.toFloat() / evaluatedCells > 0.70f) {
+            sceneChangeFrames++
+            if (sceneChangeFrames >= 3) {
+                java.util.Arrays.fill(refSet, false)
+                framesSinceReset = 0
+                sceneChangeFrames = 0
+                Log.d(TAG, "scene changed, reference reset")
+            }
+            return null
+        }
+        sceneChangeFrames = 0
+
+        val scans = Array(3) { LaneScan() }
+
+        for (lane in 0..2) {
+            val sc = scans[lane]
+            var i = 0
+
+            while (i < n) {
+                val k = lane * n + i
+
+                if (!usable[k] || !refSet[k]) {
+                    i++
+                    continue
+                }
+
+                sc.evaluated = true
+
+                if (!anomalous[k]) {
+                    i++
+                    continue
+                }
+
+                // Extend the run, tolerating a single clean step inside it.
+                var last = i
+                var gapUsed = false
+                while (last + 1 < n) {
+                    val kn = lane * n + last + 1
+                    if (usable[kn] && anomalous[kn]) {
+                        last++
+                    } else if (!gapUsed &&
+                        last + 2 < n &&
+                        usable[lane * n + last + 2] &&
+                        anomalous[lane * n + last + 2]
+                    ) {
+                        gapUsed = true
+                        last += 2
+                    } else {
+                        break
+                    }
+                }
+
+                val runLen = last - i + 1
+                var gsum = 0f
+                for (q in i..last) gsum += gold[lane * n + q]
+                val goldAvg = gsum / runLen
+
+                // Short gold patches along the lane are coins, not obstacles.
+                if (runLen <= 3 && goldAvg in 0.05f..0.55f) {
+                    sc.coins += runLen
+                    i = last + 1
+                    continue
+                }
+
+                // A single isolated far step is noise.
+                if (runLen == 1 && i > 1) {
+                    i = last + 1
+                    continue
+                }
+
+                sc.obstacleZ = zAt(i)
+                sc.beside = i <= 1
+                sc.kind =
+                    if (runLen <= 6 && last < n - 1) Geo.KIND_LOW
+                    else Geo.KIND_TALL
+                break
+            }
+        }
+
+        // Closing speed from how fast each lane's first obstacle moved.
+        for (lane in 0..2) {
+            val z = scans[lane].obstacleZ
+            val pz = prevObstZ[lane]
+
+            if (z < Geo.NO_OBSTACLE && pz < Geo.NO_OBSTACLE) {
+                val dt = (now - prevObstAt[lane]) / 1000f
+                if (dt in 0.08f..1.2f) {
+                    val rate = (pz - z) / dt
+                    if (rate in 0.3f..9f) {
+                        speedEst = (speedEst * 0.75f + rate * 0.25f)
+                            .coerceIn(0.5f, 6f)
+                    }
+                }
+            }
+
+            prevObstZ[lane] = z
+            prevObstAt[lane] = now
+        }
+
+        return scans
+    }
+
+    private fun colorDist(
+        r1: Float, g1: Float, b1: Float,
+        r2: Float, g2: Float, b2: Float
+    ): Float {
+        val dr = r1 - r2
+        val dg = g1 - g2
+        val db = b1 - b2
+        return sqrt(dr * dr + dg * dg + db * db)
     }
 
     /*
@@ -851,6 +1654,7 @@ class BotAccessibilityService : AccessibilityService() {
 
         if (root != null) {
             adSignal = containsAdvertisementSignal(root)
+            if (adSignal) adActiveUntil = now + 2000L
 
             if (adSignal) {
                 val skipOrClose = findNodeByTextOrDescription(
@@ -1040,7 +1844,7 @@ class BotAccessibilityService : AccessibilityService() {
                     lastPopupActionAt = now
 
                     state = BotState.STARTING
-                    currentLane = 1
+                    resetPerception()
 
                     /*
                      * Do NOT wait 3 seconds. Start observing almost
@@ -1221,12 +2025,7 @@ class BotAccessibilityService : AccessibilityService() {
     }
 
     private fun resetAfterRecovery() {
-        currentLane = 1
-        pendingLaneTarget = null
-        pendingLaneAttempts = 0
-        gestureBusy = false
-        playerCenterX = 0f
-        playerConfidence = 0f
+        resetPerception()
         state = BotState.RECOVERING
         consecutiveGameplayFrames = 0
         consecutiveStaticFrames = 0
@@ -1974,477 +2773,157 @@ class BotAccessibilityService : AccessibilityService() {
      * GAME BRAIN
      * ------------------------------------------------------------
      *
-     * The critical improvement over the old brain:
+     * Input: per-lane obstacle position (inverse depth) and the measured
+     * closing speed. Output: one action. Time-to-collision is
      *
-     * OLD:
-     *   "lane has edges/darkness/motion -> lane is dangerous"
+     *     ttc = (z_obstacle - Z_NEAR) / speed
      *
-     * NEW:
-     *   "compare the same collision corridor across all 3 lanes"
-     *
-     * Camera movement affects all lanes. A real obstacle usually
-     * produces a stronger local signal in one lane.
+     * so a far obstacle and an obstacle in front of the runner produce
+     * different actions. Nothing here is random: the same scene always
+     * gives the same decision.
      */
 
     private object GameBrain {
 
         fun decide(
-            bitmap: Bitmap,
-            previous: Bitmap?,
-            currentLane: Int,
-            lastLaneChangeAt: Long,
+            scans: Array<LaneScan>,
+            lane: Int,
+            speed: Float,
+            framePeriodSec: Float,
             now: Long,
-            random: Random
-        ): Decision? {
-            if (bitmap.width < 300 || bitmap.height < 500) return null
+            lastLaneChangeAt: Long,
+            laneBusy: Boolean,
+            airborne: Boolean
+        ): Decision {
 
-            val observations = Array(3) { lane ->
-                analyzeLane(bitmap, previous, lane)
-            }
+            if (laneBusy) return none("gesture or lane change in progress")
 
-            val baseline = median(observations.map { it.rawRisk })
-            val lanes = observations.map {
-                it.copy(
-                    risk = (0.50f + (it.rawRisk - baseline) * 3.20f)
-                        .coerceIn(0f, 1f)
-                )
-            }
+            val here = lane.coerceIn(0, 2)
+            val cur = scans[here]
+            if (!cur.evaluated) return none("current lane not readable")
 
-            val current = lanes[currentLane.coerceIn(0, 2)]
-            val left = if (currentLane > 0) lanes[currentLane - 1] else null
-            val right = if (currentLane < 2) lanes[currentLane + 1] else null
-            val laneChangeAllowed = now - lastLaneChangeAt >= 520L
+            val curT = ttc(cur, speed)
 
-            // Collision estimate. We use the near-band signal much more
-            // strongly than generic scene edges, and require an approaching
-            // component so rails/background don't trigger lane changes.
-            val imminent = current.risk >= 0.60f &&
-                (current.approach > 0.010f || current.hardBlock > 0.55f)
+            // Start reacting early enough that several frames are left.
+            val threatHorizon = 1.0f + 1.5f * framePeriodSec
+            val canMove = now - lastLaneChangeAt >= 380L
 
-            // Vertical action is considered before a lane change only when
-            // the lane is boxed in or the obstacle geometry suggests it.
-            if (imminent) {
-                val leftBlocked = left == null || left.hardBlock > 0.78f
-                val rightBlocked = right == null || right.hardBlock > 0.78f
+            // Best adjacent lane that is clear for long enough to enter.
+            var bestLane = -1
+            var bestScore = -1f
+            var bestTtc = 0f
 
-                val lowerObstacle =
-                    current.nearEdge > current.midEdge + 0.028f &&
-                        current.approach > 0.018f
-                val upperObstacle =
-                    current.midEdge > current.nearEdge + 0.025f
+            for (t in intArrayOf(here - 1, here + 1)) {
+                if (t < 0 || t > 2) continue
+                val sc = scans[t]
+                if (!sc.evaluated) continue
 
-                if (leftBlocked && rightBlocked && lowerObstacle) {
-                    return decision(Action.JUMP, current.risk, false, random)
-                }
-                if (upperObstacle && current.risk > 0.64f) {
-                    return decision(Action.ROLL, current.risk, false, random)
+                val tt = ttc(sc, speed)
+                if (sc.beside || tt < 0.95f) continue
+
+                val score = min(tt, 4f) + if (sc.coins > 0) 0.2f else 0f
+                if (score > bestScore) {
+                    bestScore = score
+                    bestLane = t
+                    bestTtc = tt
                 }
             }
 
-            if (laneChangeAllowed && imminent) {
-                val candidates = mutableListOf<Pair<Int, Float>>()
-                if (left != null && left.hardBlock < 0.86f) {
-                    candidates += 0 to left.risk
-                }
-                if (right != null && right.hardBlock < 0.86f) {
-                    candidates += 2 to right.risk
-                }
+            val threat = cur.obstacleZ < Geo.NO_OBSTACLE && curT < threatHorizon
 
-                if (candidates.isNotEmpty()) {
-                    val sorted = candidates.sortedBy { it.second }
-                    val safest = sorted.first()
-                    val risky = sorted.last()
+            if (!threat) {
+                // Nothing dangerous ahead. Only chase coins when everything
+                // around is comfortably clear and no recent lane change.
+                if (canMove &&
+                    now - lastLaneChangeAt >= 2500L &&
+                    curT >= 3.0f
+                ) {
+                    var coinLane = -1
+                    var coinCount = cur.coins
 
-                    // Calculated entertainment risk: normally prefer a
-                    // survivable risky lane, but never an almost-certain hit.
-                    val riskyEligible = risky.second < 0.68f &&
-                        risky.second < current.risk + 0.08f
-                    val chooseRisk = riskyEligible && random.nextFloat() < 0.70f
-                    val chosen = if (chooseRisk) risky.first else safest.first
-
-                    return if (chosen < currentLane) {
-                        decision(Action.LEFT, current.risk, true, random)
-                    } else {
-                        decision(Action.RIGHT, current.risk, true, random)
-                    }
-                }
-            }
-
-            // If a target/power-up is visible in an adjacent lane, sometimes
-            // chase it. The same safety ceiling prevents target pursuit from
-            // becoming a deliberate collision.
-            if (laneChangeAllowed) {
-                val targetCandidates = mutableListOf<Pair<Int, Float>>()
-                if (left != null && left.target > 0.48f && left.hardBlock < 0.68f) {
-                    targetCandidates += 0 to left.target
-                }
-                if (right != null && right.target > 0.48f && right.hardBlock < 0.68f) {
-                    targetCandidates += 2 to right.target
-                }
-                if (targetCandidates.isNotEmpty() && random.nextFloat() < 0.58f) {
-                    val chosen = targetCandidates.maxByOrNull { it.second }!!.first
-                    return if (chosen < currentLane) {
-                        decision(Action.LEFT, 0.62f, true, random)
-                    } else {
-                        decision(Action.RIGHT, 0.62f, true, random)
-                    }
-                }
-            }
-
-            // Audience-confusion movement: only in a genuinely clear scene,
-            // with a cooldown and only toward a lane that is not hard-blocked.
-            if (laneChangeAllowed && current.risk < 0.42f && random.nextFloat() < 0.035f) {
-                val options = mutableListOf<Int>()
-                if (left != null && left.hardBlock < 0.48f) options += 0
-                if (right != null && right.hardBlock < 0.48f) options += 2
-                if (options.isNotEmpty()) {
-                    val chosen = options.random(random)
-                    return if (chosen < currentLane) {
-                        decision(Action.LEFT, 0.42f, true, random)
-                    } else {
-                        decision(Action.RIGHT, 0.42f, true, random)
-                    }
-                }
-            }
-
-            return Decision(
-                action = Action.NONE,
-                confidence = 0.72f,
-                cooldownMs = 150L,
-                nextCaptureMs = 70L + random.nextLong(0L, 24L),
-                gestureMs = 100L
-            )
-        }
-
-        private fun analyzeLane(
-            bitmap: Bitmap,
-            previous: Bitmap?,
-            lane: Int
-        ): LaneInfo {
-
-            val width = bitmap.width
-            val height = bitmap.height
-
-            /*
-             * Perspective lane windows.
-             * Narrower at the top, wider near the player.
-             */
-            val centerFractions =
-                floatArrayOf(
-                    0.27f,
-                    0.50f,
-                    0.73f
-                )
-
-            val centerX =
-                width *
-                    centerFractions[lane]
-
-            val laneHalfWidth =
-                width * 0.115f
-
-            val x0 =
-                max(
-                    0,
-                    (centerX - laneHalfWidth).toInt()
-                )
-
-            val x1 =
-                min(
-                    width,
-                    (centerX + laneHalfWidth).toInt()
-                )
-
-            /*
-             * Two collision bands:
-             *
-             * MID  = object is approaching
-             * NEAR = object is close to player
-             */
-            val mid =
-                bandMetrics(
-                    bitmap,
-                    previous,
-                    x0,
-                    x1,
-                    (height * 0.48f).toInt(),
-                    (height * 0.70f).toInt()
-                )
-
-            val near =
-                bandMetrics(
-                    bitmap,
-                    previous,
-                    x0,
-                    x1,
-                    (height * 0.70f).toInt(),
-                    (height * 0.89f).toInt()
-                )
-
-            /*
-             * Camera motion affects all lanes.
-             * Raw risk is only a relative signal.
-             */
-            val target = targetScore(bitmap, x0, x1, (height * 0.38f).toInt(), (height * 0.78f).toInt())
-
-            val rawRisk =
-                near.motion * 0.42f +
-                    near.edge * 0.22f +
-                    near.strongEdge * 0.22f +
-                    mid.motion * 0.24f +
-                    mid.edge * 0.16f +
-                    near.darkness * 0.08f
-
-            val approach = near.motion - mid.motion
-            val hardBlock = (
-                near.strongEdge * 1.25f +
-                    near.motion * 0.55f +
-                    max(0f, approach) * 1.15f
-            ).coerceIn(0f, 1f)
-
-            return LaneInfo(
-                rawRisk = rawRisk.coerceIn(0f, 1f),
-                risk = 0f,
-                nearEdge = near.edge,
-                midEdge = mid.edge,
-                nearMotion = near.motion,
-                midMotion = mid.motion,
-                nearDark = near.darkness,
-                approach = approach,
-                target = target,
-                hardBlock = hardBlock
-            )
-        }
-
-        private fun targetScore(
-            bitmap: Bitmap,
-            x0: Int,
-            x1: Int,
-            y0: Int,
-            y1: Int
-        ): Float {
-            val width = bitmap.width
-            val height = bitmap.height
-            val sx = max(6, (x1 - x0) / 16)
-            val sy = max(7, (y1 - y0) / 18)
-            var total = 0
-            var target = 0
-            var y = y0
-            while (y < y1) {
-                var x = x0
-                while (x < x1) {
-                    val c = bitmap.getPixel(min(width - 1, x), min(height - 1, y))
-                    val r = Color.red(c)
-                    val g = Color.green(c)
-                    val b = Color.blue(c)
-                    val yellow = r > 185 && g > 120 && b < 105 && r > b * 1.6f
-                    val orange = r > 185 && g > 75 && g < 190 && b < 90 && r > g * 1.15f
-                    if (yellow || orange) target++
-                    total++
-                    x += sx
-                }
-                y += sy
-            }
-            return if (total == 0) 0f else (target.toFloat() / total * 4.5f).coerceIn(0f, 1f)
-        }
-
-        private fun bandMetrics(
-            bitmap: Bitmap,
-            previous: Bitmap?,
-            x0: Int,
-            x1: Int,
-            y0: Int,
-            y1: Int
-        ): BandMetrics {
-
-            val width = bitmap.width
-            val height = bitmap.height
-
-            val sx =
-                max(
-                    6,
-                    (x1 - x0) / 18
-                )
-
-            val sy =
-                max(
-                    7,
-                    (y1 - y0) / 18
-                )
-
-            var samples = 0
-            var edge = 0
-            var strongEdge = 0
-            var motion = 0
-            var dark = 0
-
-            var y = y0
-
-            while (y < y1) {
-                var x = x0 + sx / 2
-
-                while (x < x1) {
-                    val c =
-                        bitmap.getPixel(
-                            x,
-                            y
-                        )
-
-                    val right =
-                        bitmap.getPixel(
-                            min(
-                                width - 1,
-                                x + sx
-                            ),
-                            y
-                        )
-
-                    val down =
-                        bitmap.getPixel(
-                            x,
-                            min(
-                                height - 1,
-                                y + sy
-                            )
-                        )
-
-                    val l =
-                        luminance(c)
-
-                    val lr =
-                        luminance(right)
-
-                    val ld =
-                        luminance(down)
-
-                    val gradient =
-                        abs(l - lr) +
-                            abs(l - ld)
-
-                    if (gradient > 34) {
-                        edge++
-                    }
-
-                    if (gradient > 72) {
-                        strongEdge++
-                    }
-
-                    if (l < 58) {
-                        dark++
-                    }
-
-                    if (
-                        previous != null &&
-                        x < previous.width &&
-                        y < previous.height
-                    ) {
-                        val p =
-                            previous.getPixel(
-                                x,
-                                y
-                            )
-
-                        if (
-                            abs(
-                                l -
-                                    luminance(p)
-                            ) > 26
-                        ) {
-                            motion++
+                    for (t in intArrayOf(here - 1, here + 1)) {
+                        if (t < 0 || t > 2) continue
+                        val sc = scans[t]
+                        if (!sc.evaluated || sc.beside) continue
+                        if (ttc(sc, speed) < 3.0f) continue
+                        if (sc.coins >= 3 && sc.coins > coinCount) {
+                            coinCount = sc.coins
+                            coinLane = t
                         }
                     }
 
-                    samples++
-                    x += sx
+                    if (coinLane >= 0) {
+                        return move(here, coinLane, "coins in lane $coinLane")
+                    }
                 }
-
-                y += sy
+                return none("clear")
             }
 
-            if (samples == 0) {
-                return BandMetrics(
-                    0f,
-                    0f,
-                    0f,
-                    0f
-                )
+            // ---- threat in the current lane
+            if (cur.kind == Geo.KIND_LOW) {
+                // Prefer a clearly free neighbour lane over a jump.
+                if (bestLane >= 0 && bestScore >= 2.2f && canMove) {
+                    return move(here, bestLane, "low obstacle, lane $bestLane clear ${fmt(bestTtc)}s")
+                }
+
+                val windowHi = 0.55f + 0.6f * framePeriodSec
+                if (!airborne && curT in 0.12f..windowHi) {
+                    return Decision(Action.JUMP, "low obstacle ttc=${fmt(curT)}s")
+                }
+
+                if (bestLane >= 0 && canMove && curT < 0.6f) {
+                    return move(here, bestLane, "low obstacle, jump unavailable")
+                }
+
+                return none("low obstacle, waiting for jump window (ttc=${fmt(curT)}s)")
             }
 
-            return BandMetrics(
-                edge =
-                    edge.toFloat() /
-                        samples,
-                strongEdge =
-                    strongEdge.toFloat() /
-                        samples,
-                motion =
-                    motion.toFloat() /
-                        samples,
-                darkness =
-                    dark.toFloat() /
-                        samples
-            )
-        }
+            // Tall obstacle (train / wall): only a lane change helps.
+            if (bestLane >= 0 && canMove) {
+                return move(here, bestLane, "tall obstacle ttc=${fmt(curT)}s, lane $bestLane clear ${fmt(bestTtc)}s")
+            }
 
-        private fun median(values: List<Float>): Float {
-            if (values.isEmpty()) return 0f
+            // No lane is clear for long enough. Take the neighbour that at
+            // least gives clearly more time than staying.
+            if (canMove) {
+                var fallLane = -1
+                var fallTtc = curT + 0.5f
 
-            val sorted =
-                values.sorted()
-
-            return sorted[
-                sorted.size / 2
-            ]
-        }
-
-        private fun decision(
-            action: Action,
-            danger: Float,
-            laneChange: Boolean,
-            random: Random
-        ): Decision {
-
-            /*
-             * High danger = faster reaction.
-             * Small random variation preserves non-identical timing,
-             * but randomness never selects the direction.
-             */
-            val reaction =
-                if (danger >= 0.78f) {
-                    random.nextLong(72L, 125L)
-                } else if (danger >= 0.65f) {
-                    random.nextLong(90L, 155L)
-                } else {
-                    random.nextLong(110L, 190L)
+                for (t in intArrayOf(here - 1, here + 1)) {
+                    if (t < 0 || t > 2) continue
+                    val sc = scans[t]
+                    if (!sc.evaluated || sc.beside) continue
+                    val tt = ttc(sc, speed)
+                    if (tt > fallTtc) {
+                        fallTtc = tt
+                        fallLane = t
+                    }
                 }
 
-            val cooldown =
-                if (laneChange) {
-                    random.nextLong(210L, 300L)
-                } else {
-                    random.nextLong(180L, 260L)
+                if (fallLane >= 0) {
+                    return move(here, fallLane, "least-bad lane $fallLane (${fmt(fallTtc)}s)")
                 }
+            }
 
-            val gesture =
-                random.nextLong(85L, 135L)
+            return none("blocked, no better lane (ttc=${fmt(curT)}s)")
+        }
 
+        private fun ttc(sc: LaneScan, speed: Float): Float {
+            if (sc.obstacleZ >= Geo.NO_OBSTACLE) return 99f
+            return max(0f, (sc.obstacleZ - Geo.Z_NEAR) / max(0.3f, speed))
+        }
+
+        private fun move(from: Int, to: Int, why: String): Decision {
             return Decision(
-                action = action,
-                confidence =
-                    danger.coerceIn(0f, 1f),
-                cooldownMs = cooldown,
-                nextCaptureMs = reaction,
-                gestureMs = gesture
+                if (to < from) Action.LEFT else Action.RIGHT,
+                why
             )
         }
 
-        private fun luminance(color: Int): Int {
-            return (
-                Color.red(color) * 299 +
-                    Color.green(color) * 587 +
-                    Color.blue(color) * 114
-                ) / 1000
-        }
+        private fun none(why: String): Decision = Decision(Action.NONE, why)
+
+        private fun fmt(v: Float): String =
+            (Math.round(v * 10f) / 10f).toString()
     }
 
     /*
@@ -2456,83 +2935,119 @@ class BotAccessibilityService : AccessibilityService() {
     private fun performDecision(
         decision: Decision,
         width: Int,
-        height: Int
+        height: Int,
+        now: Long
     ) {
         if (!enabled || !controllerActive || !gameForeground || durationExpired()) return
         if (gestureBusy) return
-
-        val now = SystemClock.elapsedRealtime()
-        val startX = if (playerConfidence >= 0.34f) {
-            playerCenterX.toInt().coerceIn((width * 0.12f).toInt(), (width * 0.88f).toInt())
-        } else {
-            (width * 0.50f).toInt()
-        }
-        val startY = (height * 0.80f).toInt()
+        if (now - lastActionAt < 140L) return
 
         when (decision.action) {
             Action.LEFT -> {
-                if (currentLane <= 0) return
+                if (currentLane <= 0 || pendingLaneTarget != null) return
+                // Only a REQUEST: currentLane stays until the runner is seen
+                // in the new lane.
+                pendingLaneOrigin = currentLane
                 pendingLaneTarget = currentLane - 1
                 pendingLaneRequestedAt = now
                 pendingLaneAttempts = 0
+                pendingLaneFrames = 0
                 gestureBusy = true
-                dispatchHorizontalSwipe(-1, width, height, decision.gestureMs)
+                dispatchHorizontalSwipe(-1, width, height)
             }
+
             Action.RIGHT -> {
-                if (currentLane >= 2) return
+                if (currentLane >= 2 || pendingLaneTarget != null) return
+                pendingLaneOrigin = currentLane
                 pendingLaneTarget = currentLane + 1
                 pendingLaneRequestedAt = now
                 pendingLaneAttempts = 0
+                pendingLaneFrames = 0
                 gestureBusy = true
-                dispatchHorizontalSwipe(1, width, height, decision.gestureMs)
+                dispatchHorizontalSwipe(1, width, height)
             }
+
             Action.JUMP -> {
+                if (airborne || pendingVertical != null) return
+                pendingVertical = Action.JUMP
+                verticalRequestedAt = now
+                lastVerticalAt = now
+                airborne = true
+                airborneSince = now
                 gestureBusy = true
-                dispatchVerticalSwipe(1, startX, startY, width, height, decision.gestureMs)
+                dispatchVerticalSwipe(1, width, height)
             }
+
             Action.ROLL -> {
+                if (pendingVertical != null) return
+                pendingVertical = Action.ROLL
+                verticalRequestedAt = now
+                lastVerticalAt = now
                 gestureBusy = true
-                dispatchVerticalSwipe(-1, startX, startY, width, height, decision.gestureMs)
+                dispatchVerticalSwipe(-1, width, height)
             }
+
             Action.TAP -> {
                 gestureBusy = true
                 tap(width / 2, (height * 0.58f).toInt())
                 handler.postDelayed({ gestureBusy = false }, 140L)
             }
+
             Action.NONE -> return
         }
+
         lastActionAt = now
+        Log.d(
+            TAG,
+            "${decision.action} lane=$currentLane x=${playerCenterX} " +
+                "conf=${playerConfidence} speed=$speedEst :: ${decision.reason}"
+        )
     }
 
+    private fun playerPixelX(width: Int): Int =
+        if (playerCenterX > 0f) (playerCenterX * width).toInt() else width / 2
+
+    /**
+     * Starts at the runner's visible x, shifted inward only as far as needed
+     * so the whole swipe stays on screen. A swipe that gets clipped at the
+     * screen edge becomes too short for the game to read as a lane change.
+     */
     private fun dispatchHorizontalSwipe(
         direction: Int,
         width: Int,
-        height: Int,
-        duration: Long
+        height: Int
     ) {
-        val startX = if (playerConfidence >= 0.34f) {
-            playerCenterX.toInt().coerceIn((width * 0.15f).toInt(), (width * 0.85f).toInt())
+        val margin = (width * 0.04f).toInt()
+        val distance = min(
+            (width * 0.34f * swipeBoost).toInt(),
+            (width * 0.80f).toInt()
+        )
+
+        val playerX = playerPixelX(width)
+        val startX = if (direction > 0) {
+            playerX.coerceIn(margin, width - margin - distance)
         } else {
-            (width * 0.50f).toInt()
+            playerX.coerceIn(margin + distance, width - margin)
         }
+        val endX = startX + direction * distance
         val y = (height * 0.80f).toInt()
-        val distance = (width * 0.34f).toInt()
-        val endX = (startX + direction * distance).coerceIn(4, width - 4)
 
         val path = Path().apply {
             moveTo(startX.toFloat(), y.toFloat())
             lineTo(endX.toFloat(), y.toFloat())
         }
+
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0L, max(80L, duration)))
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 100L))
             .build()
 
         val accepted = dispatchGesture(
             gesture,
             object : GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
-                    // Completion only means AccessibilityService completed the
-                    // gesture. Lane movement is still verified visually.
+                    // Completed != the runner moved. Only the next frames
+                    // can confirm that.
+                    gestureBusy = false
                 }
 
                 override fun onCancelled(gestureDescription: GestureDescription?) {
@@ -2543,109 +3058,76 @@ class BotAccessibilityService : AccessibilityService() {
             null
         )
 
+        // Safety net in case a callback never arrives.
+        handler.postDelayed({ gestureBusy = false }, 500L)
+
         if (!accepted) {
+            Log.w(TAG, "dispatchGesture rejected the horizontal swipe")
             gestureBusy = false
             pendingLaneTarget = null
             pendingLaneAttempts = 0
         }
     }
 
+    /**
+     * direction  1 = JUMP (swipe up),  -1 = ROLL (swipe down).
+     * Roll starts mid-screen so the full swipe length is available; the old
+     * version started at 80% height and was clipped to a tiny swipe.
+     */
     private fun dispatchVerticalSwipe(
         direction: Int,
-        startX: Int,
-        startY: Int,
         width: Int,
-        height: Int,
-        duration: Long
+        height: Int
     ) {
-        val distance = (height * 0.32f).toInt()
-        val endY = (startY - direction * distance).coerceIn((height * 0.18f).toInt(), (height * 0.96f).toInt())
-        val path = Path().apply {
-            moveTo(startX.toFloat(), startY.toFloat())
-            lineTo(startX.toFloat(), endY.toFloat())
+        val x = playerPixelX(width)
+            .coerceIn((width * 0.12f).toInt(), (width * 0.88f).toInt())
+
+        val startY: Int
+        val endY: Int
+
+        if (direction > 0) {
+            startY = (height * 0.80f).toInt()
+            endY = (startY - height * 0.32f * vertBoost)
+                .toInt()
+                .coerceAtLeast((height * 0.12f).toInt())
+        } else {
+            startY = (height * 0.52f).toInt()
+            endY = (startY + height * 0.30f * vertBoost)
+                .toInt()
+                .coerceAtMost((height * 0.95f).toInt())
         }
+
+        val path = Path().apply {
+            moveTo(x.toFloat(), startY.toFloat())
+            lineTo(x.toFloat(), endY.toFloat())
+        }
+
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0L, max(80L, duration)))
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 100L))
             .build()
+
         val accepted = dispatchGesture(
             gesture,
             object : GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) {
-                    handler.postDelayed({ gestureBusy = false }, 110L)
+                    handler.postDelayed({ gestureBusy = false }, 60L)
                 }
+
                 override fun onCancelled(gestureDescription: GestureDescription?) {
                     gestureBusy = false
                 }
             },
             null
         )
-        if (!accepted) gestureBusy = false
-    }
 
-    private fun laneCenterX(
-        lane: Int,
-        width: Int
-    ): Int {
+        handler.postDelayed({ gestureBusy = false }, 500L)
 
-        return when (lane) {
-            0 -> (width * 0.27f).toInt()
-            2 -> (width * 0.73f).toInt()
-            else -> (width * 0.50f).toInt()
+        if (!accepted) {
+            Log.w(TAG, "dispatchGesture rejected the vertical swipe")
+            gestureBusy = false
+            pendingVertical = null
+            airborne = false
         }
-    }
-
-    private fun swipe(
-        x1: Int,
-        y1: Int,
-        x2: Int,
-        y2: Int,
-        duration: Long
-    ) {
-
-        val path =
-            Path().apply {
-                moveTo(
-                    x1.toFloat(),
-                    y1.toFloat()
-                )
-
-                /*
-                 * Slightly curved path.
-                 * Direction remains the actual decision.
-                 */
-                val controlX =
-                    (x1 + x2) / 2f
-
-                val controlY =
-                    (
-                        min(y1, y2) -
-                            abs(y2 - y1) * 0.06f
-                        )
-
-                quadTo(
-                    controlX,
-                    controlY,
-                    x2.toFloat(),
-                    y2.toFloat()
-                )
-            }
-
-        val gesture =
-            GestureDescription.Builder()
-                .addStroke(
-                    GestureDescription.StrokeDescription(
-                        path,
-                        0L,
-                        duration
-                    )
-                )
-                .build()
-
-        dispatchGesture(
-            gesture,
-            null,
-            null
-        )
     }
 
     private fun tap(
