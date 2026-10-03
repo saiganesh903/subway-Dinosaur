@@ -156,11 +156,12 @@ class BotAccessibilityService : AccessibilityService() {
         val packageName =
             event.packageName?.toString()
 
-        gameForeground =
-            packageName == GAME_PACKAGE
+        if (packageName == GAME_PACKAGE) {
+            gameForeground = true
 
-        if (gameForeground && enabled) {
-            beginController()
+            if (enabled) {
+                beginController()
+            }
         }
     }
 
