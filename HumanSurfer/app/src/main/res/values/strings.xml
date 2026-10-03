@@ -1,4 +1,9 @@
 <resources>
+
     <string name="app_name">Human Surfer</string>
-    <string name="accessibility_description">Reads the game screen and sends swipe gestures for the Human Surfer game assistant.</string>
+
+    <string name="accessibility_service_description">
+        Allows Human Surfer to understand the game screen and perform game gestures.
+    </string>
+
 </resources>
